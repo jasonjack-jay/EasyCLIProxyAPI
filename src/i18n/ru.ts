@@ -1,6 +1,15 @@
 import type { MessageKey } from './locales/zh-CN';
 
 export const ru: Record<MessageKey, string> = {
+  'home.catalog.refresh': "Обновить каталоги моделей",
+  'home.catalog.refreshing': "Синхронизация каталогов…",
+  'home.catalog.hint': "Синхронизировать удалённые каталоги моделей и их возможности без перезапуска ядра",
+  'home.catalog.success': "Каталоги моделей синхронизированы.",
+  'home.catalog.updated': "Каталоги моделей синхронизированы. Обновлены провайдеры: {providers}.",
+  'home.catalog.failed': "Не удалось синхронизировать каталоги моделей: {error}",
+  'home.catalog.unsupported': "Это ядро не поддерживает обновление каталогов моделей. Обновите ядро в разделе управления версиями.",
+  'home.catalog.invalidResponse': "Ядро вернуло некорректный результат обновления каталогов моделей.",
+  'home.catalog.codexSyncFailed': 'Каталоги моделей ядра обновлены, но не удалось синхронизировать каталог Codex: {error}',
   'routing.inventoryUnknown': 'Статус учетных записей недоступен. Ожидание подключения к шлюзу.',
   'routing.policyTitle': 'Политика шлюза',
   'routing.policyDescription': 'Глобальные правила маршрутизации и повторных попыток для каждого уровня.',
