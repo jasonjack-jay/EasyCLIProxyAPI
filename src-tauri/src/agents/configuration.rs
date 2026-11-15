@@ -3515,19 +3515,23 @@ pub(crate) fn build_codex_agent_config_with_oauth(
             .map_err(|error| format!("Invalid Codex config.toml format: {error}"))?,
         None => Document::new(),
     };
-    let provider_id = if codex_uses_openai_proxy(&document) { "openai" } else { MANAGED_AGENT_PROVIDER_ID };
-    if provider_id == "openai" {
-        let previous_oauth = codex_provider_table(&document)
-            .and_then(|p| p.get("requires_openai_auth")).and_then(Item::as_bool) == Some(true);
-        if previous_oauth != oauth_configuration {
-            return Err("Turn off the openai provider identity before changing the sign-in method".into());
+    if let Some(settings) = codex_selected_profile_settings(&document) {
+        for (key, item) in settings.iter() {
+            set_codex_table_item(document.as_table_mut(), key, item.clone());
         }
-        set_codex_table_item(document.as_table_mut(), "openai_base_url", value(base_url));
+    }
+    if document.contains_key("forced_login_method") {
+        set_codex_table_item(document.as_table_mut(), "forced_login_method",
+            value(if oauth_configuration { "chatgpt" } else { "api" }));
+    }
+    document.remove("profile");
+    if document.contains_key("cli_auth_credentials_store") {
+        set_codex_table_item(document.as_table_mut(), "cli_auth_credentials_store", value("file"));
     }
     set_codex_table_item(
         document.as_table_mut(),
         "model_provider",
-        value(provider_id),
+        value(MANAGED_AGENT_PROVIDER_ID),
     );
     set_codex_table_item(document.as_table_mut(), "model", value(model));
     set_codex_table_item(
@@ -3561,6 +3565,8 @@ pub(crate) fn build_codex_agent_config_with_oauth(
     set_codex_table_item(provider, "base_url", value(base_url));
     set_codex_table_item(provider, "wire_api", value("responses"));
     set_codex_table_item(provider, "experimental_bearer_token", value(api_key));
+    provider.remove("env_key");
+    provider.remove("env_key_instructions");
     if oauth_configuration {
         set_codex_table_item(provider, "requires_openai_auth", value(true));
     } else {
@@ -3589,12 +3595,7 @@ pub(crate) fn build_codex_auth_update(
 ) -> Result<AgentFileUpdate, String> {
     let path = codex_configuration_directory(home).join("auth.json");
     let after = if oauth_configuration {
-        if validate_codex_oauth_login_at(&path).is_ok() {
-            read_optional_text(&path)?
-                .ok_or_else(|| "Codex OAuth login credentials were deleted before the application configuration was applied. Sign in again".to_string())?
-        } else {
-            available_codex_oauth_auth(home)?
-        }
+        available_codex_oauth_auth(home)?
     } else {
         let path_text = read_optional_text(&path)?;
         let mut root = parse_agent_json_object(path_text.as_deref(), "Codex auth.json")?;
@@ -3606,13 +3607,15 @@ pub(crate) fn build_codex_auth_update(
     Ok(AgentFileUpdate { path, after })
 }
 
-const CODEX_MANAGED_ROOT_KEYS: [&str; 3] = ["model_provider", "model", "model_catalog_json"];
-const CODEX_MANAGED_PROVIDER_KEYS: [&str; 5] = [
+const CODEX_MANAGED_ROOT_KEYS: [&str; 6] = ["model_provider", "model", "model_catalog_json", "forced_login_method", "profile", "cli_auth_credentials_store"];
+const CODEX_MANAGED_PROVIDER_KEYS: [&str; 7] = [
     "name",
     "base_url",
     "wire_api",
     "experimental_bearer_token",
     "requires_openai_auth",
+    "env_key",
+    "env_key_instructions",
 ];
 
 pub(crate) fn set_codex_table_item(
@@ -3714,6 +3717,25 @@ pub(crate) fn merge_missing_codex_table_items(
     }
 }
 
+pub(crate) fn codex_selected_profile_settings(
+    document: &toml_edit::Document,
+) -> Option<toml_edit::Document> {
+    let name = document.get("profile")?.as_str()?;
+    let profile = document.get("profiles")?.as_table()?.get(name)?.as_table()?;
+    let mut settings = toml_edit::Document::new();
+    for (key, item) in profile.iter() {
+        let mut item = item.clone();
+        if let (Some(selected), Some(root)) = (
+            item.as_table_mut(),
+            document.get(key).and_then(toml_edit::Item::as_table),
+        ) {
+            merge_missing_codex_table_items(selected, root);
+        }
+        settings.as_table_mut().insert(key, item);
+    }
+    Some(settings)
+}
+
 pub(crate) fn build_restored_codex_agent_config(
     current: Option<&str>,
     original: Option<&str>,
@@ -3732,6 +3754,23 @@ pub(crate) fn build_restored_codex_agent_config_with_policy(
     let original_document = original
         .map(|content| parse_codex_document(Some(content), "Original Codex config.toml"))
         .transpose()?;
+    if let Some(original) = original_document.as_ref() {
+        if let Some(settings) = codex_selected_profile_settings(original) {
+            let selected: toml::Value = toml::from_str(&settings.to_string())
+                .map_err(|error| format!("Invalid Codex profile settings: {error}"))?;
+            let current: toml::Value = toml::from_str(&current_document.to_string())
+                .map_err(|error| format!("Invalid current Codex configuration: {error}"))?;
+            for (key, _) in settings.iter() {
+                if !CODEX_MANAGED_ROOT_KEYS.contains(&key) && current.get(key) == selected.get(key) {
+                    restore_codex_table_item(
+                        current_document.as_table_mut(),
+                        Some(original.as_table()),
+                        key,
+                    );
+                }
+            }
+        }
+    }
     if let Some(original_document) = original_document.as_ref() {
         merge_missing_codex_table_items(
             current_document.as_table_mut(),
@@ -3997,9 +4036,32 @@ pub(crate) fn build_zcode_agent_config(
     api.insert("type".to_string(), serde_json::json!("anthropic-messages"));
     api.insert("baseUrl".to_string(), serde_json::json!(base_url));
     let ordered = ordered_agent_models(available_models, model);
-    let model_names = ordered.iter().map(|option| option.name.as_str()).collect::<Vec<_>>();
-    provider_config.entry("personalModelIds").or_insert_with(|| serde_json::json!(model_names));
-    provider_config.entry("modelOrder").or_insert_with(|| serde_json::json!(model_names));
+    let model_names = ordered.iter().map(|option| option.name.clone()).collect::<Vec<String>>();
+    if !model_names.is_empty() {
+        // Models removed or disabled in the gateway disappear from /v1/models,
+        // but the previous lists kept their ids forever and ZCode kept showing
+        // these dead entries. Prune to the live catalog, drop duplicates and
+        // preserve the user's order. Never append: a model the user removed
+        // from the list must stay removed while it still exists upstream.
+        let available = model_names.iter().map(String::as_str).collect::<std::collections::HashSet<_>>();
+        let prune = |entries: &[serde_json::Value]| -> Vec<String> {
+            let mut seen = std::collections::HashSet::new();
+            entries.iter().filter_map(serde_json::Value::as_str)
+                .filter(|name| available.contains(*name))
+                .filter(|name| seen.insert((*name).to_string()))
+                .map(String::from).collect()
+        };
+        let personal_model_ids = match provider_config.get("personalModelIds").and_then(serde_json::Value::as_array) {
+            Some(entries) => prune(entries),
+            None => model_names.clone(),
+        };
+        let model_order = match provider_config.get("modelOrder").and_then(serde_json::Value::as_array) {
+            Some(entries) => prune(entries),
+            None => model_names.clone(),
+        };
+        provider_config.insert("personalModelIds".to_string(), serde_json::json!(personal_model_ids));
+        provider_config.insert("modelOrder".to_string(), serde_json::json!(model_order));
+    }
     rules.retain(|rule| {
         rule.get("providerId").and_then(serde_json::Value::as_str)
             != Some(MANAGED_AGENT_PROVIDER_ID)
@@ -4064,37 +4126,63 @@ pub(crate) fn build_zcode_agent_config(
                 Some(500_000) | None => manual
                     .and_then(|rule| rule.pointer("/config/properties/contextWindow"))
                     .and_then(serde_json::Value::as_u64)
+                    .filter(|value| *value > 0)
                     .or(inferred_cw)
                     .or(option.context_window),
                 Some(cw) => Some(cw).or(inferred_cw),
             };
-            if let Some(context_window) = effective_cw {
+            // ZCode validates contextWindow as a positive integer and discards the
+            // entire personal provider config when any rule carries a non-positive
+            // value. Never persist 0; manual rules still require the field present.
+            if let Some(context_window) = effective_cw.filter(|value| *value > 0) {
                 properties.insert("contextWindow".to_string(), serde_json::json!(context_window));
-            } else if manual.is_none() {
+            } else if manual.is_some() {
+                properties.insert(
+                    "contextWindow".to_string(),
+                    serde_json::json!(zcode::ZCODE_MANUAL_CONTEXT_WINDOW_FALLBACK),
+                );
+            } else {
                 properties.remove("contextWindow");
             }
         }
         let specs = ensure_json_object_entry(config_obj, "optionSpecs");
-        if let Some(mot) = inferred_mot {
+        if let Some(mot) = inferred_mot.filter(|value| *value > 0) {
             specs.entry("maxOutputTokens").or_insert_with(|| serde_json::json!({ "max": mot }));
+        }
+        // Drop a stale or non-positive max carried over from the existing rule:
+        // ZCode requires maxOutputTokens.max to be a positive integer. Manual rules
+        // keep a positive fallback because the field is mandatory for them.
+        let has_positive_max = specs
+            .get("maxOutputTokens")
+            .and_then(|value| value.get("max"))
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|value| value > 0);
+        if !has_positive_max {
+            specs.remove("maxOutputTokens");
         }
         if let Some(mot_obj) = specs.get_mut("maxOutputTokens").and_then(serde_json::Value::as_object_mut) { mot_obj.remove("map"); }
         if manual.is_some() && !specs.contains_key("maxOutputTokens") {
             specs.insert("maxOutputTokens".to_string(), serde_json::json!({ "max": zcode::ZCODE_MANUAL_MAX_OUTPUT_TOKENS_FALLBACK }));
         }
-        if !option.reasoning_levels.is_empty() {
-            let is_generated_map = |m: &str| {
-                m == ZCODE_CPA_REASONING_MAP || m == "reasoningLevel == \"none\" ? {\"thinking\": {\"type\": \"disabled\"}} : {\"thinking\": {\"type\": \"adaptive\"}, \"output_config\": {\"effort\": reasoningLevel}}"
-            };
-            let generated = manual.is_none() && specs.get("reasoningLevel")
-                .and_then(|spec| spec.get("map")).and_then(serde_json::Value::as_str)
-                .map(is_generated_map).unwrap_or(false);
+        let mut reasoning_levels = zcode::sanitize_reasoning_levels(&option.reasoning_levels);
+        if reasoning_levels.is_empty() && manual.is_some() {
+            reasoning_levels = zcode::ZCODE_MANUAL_REASONING_LEVELS_FALLBACK.iter().map(|level| (*level).to_string()).collect();
+        }
+        let is_generated_map = |m: &str| {
+            m == ZCODE_CPA_REASONING_MAP || m == "reasoningLevel == \"none\" ? {\"thinking\": {\"type\": \"disabled\"}} : {\"thinking\": {\"type\": \"adaptive\"}, \"output_config\": {\"effort\": reasoningLevel}}"
+        };
+        let generated = manual.is_none() && specs.get("reasoningLevel")
+            .and_then(|spec| spec.get("map")).and_then(serde_json::Value::as_str)
+            .map(is_generated_map).unwrap_or(false);
+        if !reasoning_levels.is_empty() {
             if generated || !specs.contains_key("reasoningLevel") {
                 specs.insert("reasoningLevel".into(), serde_json::json!({
-                    "values": option.reasoning_levels,
+                    "values": reasoning_levels,
                     "map": ZCODE_CPA_REASONING_MAP,
                 }));
             }
+        } else if generated {
+            specs.remove("reasoningLevel");
         }
         if specs.is_empty() {
             config_obj.remove("optionSpecs");
@@ -4125,14 +4213,22 @@ pub(crate) fn build_zcode_agent_config(
             provider_order.push(serde_json::json!(MANAGED_AGENT_PROVIDER_ID));
         }
     }
+    // Keep the previous default model only while it still exists; otherwise
+    // fall back to the first available model instead of pointing at a model
+    // that was disabled or deleted in the gateway.
+    let selection_model = if model_names.is_empty() || model_names.iter().any(|name| name.as_str() == model) {
+        model
+    } else {
+        model_names[0].as_str()
+    };
     let mut selection = serde_json::json!({
         "providerId": MANAGED_AGENT_PROVIDER_ID,
-        "modelId": model,
+        "modelId": selection_model,
     });
     if let Some(previous) = config.get("defaultModelSelection") {
         if previous.get("providerId").and_then(serde_json::Value::as_str)
             == Some(MANAGED_AGENT_PROVIDER_ID)
-            && previous.get("modelId").and_then(serde_json::Value::as_str) == Some(model)
+            && previous.get("modelId").and_then(serde_json::Value::as_str) == Some(selection_model)
         {
             if let Some(options) = previous.get("options") {
                 selection["options"] = options.clone();
