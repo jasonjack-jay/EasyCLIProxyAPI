@@ -9,9 +9,10 @@ use tokio_util::sync::CancellationToken;
 const PROVIDER: &str = "ecpa-antigravity-acp";
 const MAX_BODY: usize = 1024 * 1024;
 type Body = http_body_util::combinators::UnsyncBoxBody<Bytes, Infallible>;
-type SpawnClient = fn(&Path, &Path, &str) -> Result<rpc::Client, String>;
+pub(super) type SpawnClient = fn(&Path, &Path, &str) -> Result<rpc::Client, String>;
 
 #[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct Settings {
     enabled: bool,
     port: u16,
@@ -50,12 +51,32 @@ fn read_settings(profile: &Path) -> Result<Settings, String> {
     }
 }
 
+pub(super) fn upstream_enabled(profile: &Path) -> Result<bool, String> {
+    Ok(read_settings(profile)?.enabled)
+}
+
 fn save_settings(profile: &Path, settings: &Settings) -> Result<(), String> {
     prepare_profile(profile)?;
-    crate::write_codex_private_file(
+    save_private_file(
         &settings_path(profile),
         &serde_json::to_vec(settings).map_err(|e| e.to_string())?,
     )
+}
+
+fn save_private_file(path: &Path, content: &[u8]) -> Result<(), String> {
+    let mut temporary = path.as_os_str().to_os_string();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    let result = crate::write_codex_private_file(&temporary, content).and_then(|_| {
+        crate::replace_file_atomically(&temporary, path)
+            .map_err(|error| format!("Failed to save ACP configuration: {error}"))
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    } else {
+        crate::remember_software_write(path, content);
+    }
+    result
 }
 
 fn bridge_key(profile: &Path) -> Result<String, String> {
@@ -84,10 +105,11 @@ fn provider_entry(
     v8: bool,
 ) -> Result<serde_norway::Value, String> {
     let mut provider = json!({
-        "name": PROVIDER, "base-url": url, "proxy-url": "direct", "disabled": models.is_empty(),
-        "models": models.iter().map(|model| json!({"name":model.id,"alias":format!("acp/{}", model.id)})).collect::<Vec<_>>()
+        "name": PROVIDER, "base-url": url, "disabled": models.is_empty(),
+        "models": models.iter().map(|model| json!({"name":format!("acp/{}", model.id)})).collect::<Vec<_>>()
     });
-    provider[if v8 { "keys" } else { "api-key-entries" }] = json!([{"api-key":key}]);
+    provider[if v8 { "keys" } else { "api-key-entries" }] =
+        json!([{"api-key":key,"proxy-url":"direct"}]);
     serde_norway::to_value(provider).map_err(|e| e.to_string())
 }
 
@@ -95,11 +117,29 @@ fn patch_provider(
     document: &mut serde_norway::Value,
     entry: Option<serde_norway::Value>,
 ) -> Result<bool, String> {
+    if entry.is_none() {
+        let mut changed = false;
+        for path in [
+            &["openai-compatibility"][..],
+            &["api-keys", "openai-compatibility"][..],
+        ] {
+            changed |= patch_provider_at(document, path, None)?;
+        }
+        return Ok(changed);
+    }
     let path: &[&str] = if crate::core_config_uses_v8(document) {
         &["api-keys", "openai-compatibility"]
     } else {
         &["openai-compatibility"]
     };
+    patch_provider_at(document, path, entry)
+}
+
+fn patch_provider_at(
+    document: &mut serde_norway::Value,
+    path: &[&str],
+    entry: Option<serde_norway::Value>,
+) -> Result<bool, String> {
     let mut current = document.clone();
     for key in path {
         current = current
@@ -125,48 +165,96 @@ fn patch_provider(
 }
 
 fn register(url: Option<&str>, key: &str, models: &[AcpModel]) -> Result<(), String> {
-    if !crate::core_install_dir()?
-        .join(crate::CORE_CONFIG_FILE)
-        .is_file()
-    {
-        return Err("Start the CPA kernel once to generate its configuration before enabling ACP API access".into());
-    }
-    crate::patch_existing_core_config(|document| {
+    register_at(
+        &crate::core_install_dir()?.join(crate::CORE_CONFIG_FILE),
+        url,
+        key,
+        models,
+    )
+}
+
+fn register_at(
+    config: &Path,
+    url: Option<&str>,
+    key: &str,
+    models: &[AcpModel],
+) -> Result<(), String> {
+    let _guard = crate::lock_core_config_file()?;
+    let content = match std::fs::read_to_string(config) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && url.is_none() => {
+            return Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err("Start the CPA kernel once to generate its configuration before enabling ACP API access".into());
+        }
+        Err(error) => {
+            return Err(format!(
+                "Failed to read ACP provider configuration: {error}"
+            ))
+        }
+    };
+    let updated = crate::patch_core_yaml_document(&content, |document| {
         let entry = url
             .map(|url| provider_entry(url, key, models, crate::core_config_uses_v8(document)))
             .transpose()?;
         patch_provider(document, entry)
-    })
+    })?;
+    if let Some(updated) = updated {
+        save_private_file(config, updated.as_bytes())?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn set_acp_upstream_enabled(
     app: tauri::AppHandle,
     enabled: bool,
 ) -> Result<AcpStatus, String> {
+    let profile = profile(&crate::core_base_dir()?);
+    let config = crate::core_install_dir()?.join(crate::CORE_CONFIG_FILE);
+    set_enabled(&app, &profile, &config, enabled, false).await?;
+    get_acp_status(app.clone(), app.state::<AcpState>())
+}
+
+async fn set_enabled<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    profile: &Path,
+    config: &Path,
+    enabled: bool,
+    restoring: bool,
+) -> Result<AcpStatus, String> {
     let state = app.state::<AcpState>();
     let _transition = state.bridge_transition.lock().await;
-    let _guard = begin(&app, "upstream")?;
-    let profile = profile(&crate::core_base_dir()?);
-    let settings = read_settings(&profile)?;
+    let _guard = begin(app, "upstream")?;
+    let settings = read_settings(profile)?;
+    if restoring && !settings.enabled {
+        drop(_guard);
+        return state.snapshot();
+    }
     if !enabled {
-        register(None, "", &[])?;
-        // Keep the listener alive if saving fails, so an already enabled runtime
-        // cannot become an orphaned provider with a closed upstream.
-        save_settings(
-            &profile,
-            &Settings {
-                enabled: false,
-                port: settings.port,
-            },
-        )?;
-        state
+        let mut runtime = state
             .bridge
             .lock()
-            .map_err(|_| "ACP bridge state unavailable")?
-            .take();
+            .map_err(|_| "ACP bridge state unavailable")?;
         let mut status = state.status.lock().map_err(|_| "ACP state unavailable")?;
+        if settings.enabled || !settings_path(profile).is_file() {
+            save_settings(
+                profile,
+                &Settings {
+                    enabled: false,
+                    port: settings.port,
+                },
+            )?;
+        }
         status.upstream_enabled = false;
         status.upstream_url = None;
+        runtime.take();
+        state.agents.clear();
+        drop(status);
+        drop(runtime);
+        register_at(config, None, "", &[]).map_err(|error| {
+            format!("ACP API access is off, but provider cleanup failed: {error}")
+        })?;
     } else {
         let status = state.snapshot()?;
         if !status.authenticated || status.models.is_empty() {
@@ -179,9 +267,9 @@ pub(crate) async fn set_acp_upstream_enabled(
             .as_ref()
             .map(|runtime| (runtime.url.clone(), runtime.key.clone()));
         if let Some((url, key)) = existing {
-            register(Some(&url), &key, &status.models)?;
+            register_at(config, Some(&url), &key, &status.models)?;
         } else {
-            prepare_profile(&profile)?;
+            prepare_profile(profile)?;
             let listener =
                 match tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, settings.port))
                     .await
@@ -194,24 +282,22 @@ pub(crate) async fn set_acp_upstream_enabled(
                 };
             let port = listener.local_addr().map_err(|e| e.to_string())?.port();
             let url = format!("http://127.0.0.1:{port}/v1");
-            let key = bridge_key(&profile)?;
+            let key = bridge_key(profile)?;
             let stop = CancellationToken::new();
             let runtime = Runtime {
                 stop: stop.clone(),
                 url: url.clone(),
                 key: key.clone(),
             };
-            // Publish only after the socket is bound, and roll back registration
-            // if durable enablement cannot be saved.
-            register(Some(&url), &key, &status.models)?;
+            register_at(config, Some(&url), &key, &status.models)?;
             if let Err(error) = save_settings(
-                &profile,
+                profile,
                 &Settings {
                     enabled: true,
                     port,
                 },
             ) {
-                let rollback = register(None, "", &[]).err();
+                let rollback = register_at(config, None, "", &[]).err();
                 return Err(format!(
                     "{error}{}",
                     rollback
@@ -233,21 +319,23 @@ pub(crate) async fn set_acp_upstream_enabled(
         }
     }
     drop(_guard);
-    let _ = tauri::Emitter::emit(&app, crate::CONFIG_FILES_CHANGED_EVENT, ());
-    get_acp_status(app.clone(), app.state::<AcpState>())
+    let _ = tauri::Emitter::emit(app, crate::CONFIG_FILES_CHANGED_EVENT, ());
+    state.snapshot()
 }
 
 pub(crate) async fn restore(app: tauri::AppHandle) {
     let result: Result<(), String> = async {
         let profile = profile(&crate::core_base_dir()?);
-        if read_settings(&profile)?.enabled {
+        restore_if_enabled(&profile, || async {
             if let Err(error) = super::acp_connect(app.clone(), false).await {
                 register(None, "", &[])?;
                 return Err(error);
             }
-            set_acp_upstream_enabled(app.clone(), true).await?;
-        }
-        Ok(())
+            let config = crate::core_install_dir()?.join(crate::CORE_CONFIG_FILE);
+            set_enabled(&app, &profile, &config, true, true).await?;
+            Ok(())
+        })
+        .await
     }
     .await;
     if let Err(error) = result {
@@ -255,6 +343,16 @@ pub(crate) async fn restore(app: tauri::AppHandle) {
             status.error = Some(error);
         }
     }
+}
+
+async fn restore_if_enabled<F: std::future::Future<Output = Result<(), String>>>(
+    profile: &Path,
+    restore: impl FnOnce() -> F,
+) -> Result<(), String> {
+    if read_settings(profile)?.enabled {
+        restore().await?;
+    }
+    Ok(())
 }
 
 pub(super) fn sync_models(state: &AcpState) -> Result<(), String> {
@@ -311,41 +409,169 @@ fn error(status: StatusCode, message: impl AsRef<str>) -> Response<Body> {
     )
 }
 
-struct Completion {
-    model: String,
-    text: String,
-    stream: bool,
+pub(super) struct Completion {
+    pub model: String,
+    pub alias: String,
+    pub text: String,
+    pub system: String,
+    pub stream: bool,
+    pub ignored_parameters: Vec<&'static str>,
+    pub tools: Vec<Value>,
+    pub messages: Vec<Value>,
+    pub results: Vec<Value>,
 }
 
-fn parse_completion(value: &Value, models: &[AcpModel]) -> Result<Completion, String> {
-    let object = value.as_object().ok_or("Request body must be an object")?;
-    // Do not silently claim support for API controls the Agent does not expose.
-    for key in object.keys() {
-        if !["model", "messages", "stream", "stream_options"].contains(&key.as_str()) {
-            return Err(format!(
-                "ACP text access does not support parameter '{key}'"
-            ));
+pub(super) struct Output {
+    pub text: String,
+    pub calls: Vec<Value>,
+}
+impl Output {
+    pub fn finish(&self) -> &'static str {
+        if self.calls.is_empty() {
+            "stop"
+        } else {
+            "tool_calls"
         }
     }
-    let requested = value["model"].as_str().ok_or("model is required")?;
-    let model = requested.strip_prefix("acp/").unwrap_or(requested);
-    if !models.iter().any(|item| item.id == model) {
-        return Err("Unknown ACP model; refresh available models".into());
+    pub fn message(&self) -> Value {
+        let mut message = json!({"role":"assistant","content":if self.text.is_empty() && !self.calls.is_empty() { Value::Null } else { json!(self.text) }});
+        if !self.calls.is_empty() {
+            message["tool_calls"] = json!(self.calls);
+        }
+        message
     }
-    let messages = value["messages"]
-        .as_array()
-        .ok_or("messages must be an array")?;
-    if messages.len() != 1 || messages[0]["role"] != "user" {
-        return Err("ACP currently accepts one user text message per request; history and system/tool messages are not supported".into());
+}
+
+// CPA owns the public protocol translators. This upstream must still produce
+// valid Chat Completions chunks, including the initial assistant role.
+struct CompletionStream {
+    sender: tokio::sync::mpsc::Sender<Result<String, String>>,
+    cancel: Arc<AtomicBool>,
+    id: String,
+    model: String,
+    created: u64,
+    started: bool,
+}
+
+impl CompletionStream {
+    fn send(&self, mut frame: Result<String, String>) -> Result<(), String> {
+        loop {
+            if self.cancel.load(Ordering::Acquire) {
+                return Err("ACP API client disconnected or request cancelled".into());
+            }
+            match self.sender.try_send(frame) {
+                Ok(()) => return Ok(()),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(pending)) => {
+                    frame = pending;
+                    // Apply backpressure without blocking cancellation or
+                    // treating an ordinary burst of tokens as a disconnect.
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    self.cancel.store(true, Ordering::Release);
+                    return Err("ACP API client disconnected".into());
+                }
+            }
+        }
     }
-    let message = messages[0].as_object().ok_or("Invalid user message")?;
-    if message
-        .keys()
-        .any(|key| !["role", "content"].contains(&key.as_str()))
-    {
+
+    fn chunk(&self, delta: Value, finish: Option<&str>) -> Result<(), String> {
+        let value = json!({
+            "id":self.id,"object":"chat.completion.chunk","created":self.created,"model":self.model,
+            "choices":[{"index":0,"delta":delta,"finish_reason":finish,"logprobs":null}]
+        });
+        self.send(Ok(format!("data: {value}\n\n")))
+    }
+
+    fn delta(&mut self, delta: Value) -> Result<(), String> {
+        if !self.started {
+            self.chunk(json!({"role":"assistant","content":""}), None)?;
+            self.started = true;
+        }
+        self.chunk(delta, None)
+    }
+
+    fn finish(&mut self, output: &Output) -> Result<(), String> {
+        if !self.started {
+            self.delta(json!({"content":""}))?;
+        }
+        self.chunk(json!({}), Some(output.finish()))?;
+        self.send(Ok("data: [DONE]\n\n".into()))
+    }
+}
+
+fn upstream_status(message: &str) -> StatusCode {
+    if message.contains("timed out") {
+        StatusCode::GATEWAY_TIMEOUT
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
+// ACP exposes no sampling or exact token-budget controls. Chat applications
+// commonly send these even when using an agent-backed model. Validate the
+// values and report that they are not applied instead of rejecting the chat.
+fn compatibility_parameters(value: &Value) -> Result<Vec<&'static str>, String> {
+    let mut ignored = Vec::new();
+    for key in ["max_tokens", "max_completion_tokens"] {
+        if let Some(limit) = value.get(key).filter(|v| !v.is_null()) {
+            if !limit.as_u64().is_some_and(|n| n > 0) {
+                return Err(format!("{key} must be a positive integer"));
+            }
+            ignored.push(key);
+        }
+    }
+    for (key, maximum) in [("temperature", 2.0), ("top_p", 1.0)] {
+        if let Some(option) = value.get(key).filter(|v| !v.is_null()) {
+            if !option
+                .as_f64()
+                .is_some_and(|n| n.is_finite() && n >= 0.0 && n <= maximum)
+            {
+                return Err(format!("{key} must be a number between 0 and {maximum}"));
+            }
+            ignored.push(key);
+        }
+    }
+    Ok(ignored)
+}
+
+fn compatibility_headers(mut response: Response<Body>, ignored: &[&str]) -> Response<Body> {
+    if !ignored.is_empty() {
+        response.headers_mut().insert(
+            "x-ecpa-ignored-parameters",
+            ignored
+                .join(", ")
+                .parse()
+                .expect("static parameter names are valid HTTP header values"),
+        );
+    }
+    response
+}
+
+pub(super) fn message_text(message: &Value, role: &str) -> Result<String, String> {
+    let message = message
+        .as_object()
+        .ok_or_else(|| format!("Invalid {role} message"))?;
+    if message.keys().any(|key| {
+        ![
+            "role",
+            "content",
+            "name",
+            "tool_calls",
+            "tool_call_id",
+            "reasoning_content",
+        ]
+        .contains(&key.as_str())
+    }) {
         return Err("Unsupported ACP message fields".into());
     }
-    let text = match &messages[0]["content"] {
+    if message
+        .get("name")
+        .is_some_and(|name| !name.is_null() && !name.is_string())
+    {
+        return Err("Message name must be a string".into());
+    }
+    let text = match message.get("content").unwrap_or(&Value::Null) {
         Value::String(text) => text.clone(),
         Value::Array(parts) => {
             let mut text = String::new();
@@ -357,10 +583,283 @@ fn parse_completion(value: &Value, models: &[AcpModel]) -> Result<Completion, St
             }
             text
         }
+        Value::Null if role == "assistant" && message.get("tool_calls").is_some() => String::new(),
         _ => return Err("ACP accepts text content only".into()),
     };
-    if text.trim().is_empty() {
+    if text.trim().is_empty()
+        && role != "tool"
+        && !(role == "assistant" && message.get("tool_calls").is_some())
+    {
+        return Err(format!("A non-empty {role} message is required"));
+    }
+    Ok(text)
+}
+
+// The official CLI is stateless per request, so earlier turns are flattened
+// into the single prompt text block instead of a server-side conversation.
+fn prompt_text(messages: &[Value]) -> Result<String, String> {
+    let mut turns = Vec::new();
+    let mut pending = std::collections::BTreeSet::new();
+    for message in messages {
+        let role = message["role"].as_str().unwrap_or("");
+        let label = match role {
+            "system" | "developer" | "user" | "assistant" | "tool" => role,
+            "" => return Err("Invalid message role".into()),
+            role => {
+                return Err(format!(
+                    "ACP accepts system, developer, user and assistant messages only; role '{role}' is not supported"
+                ))
+            }
+        };
+        let mut text = message_text(message, label)?;
+        if role == "tool" {
+            let id = message["tool_call_id"]
+                .as_str()
+                .ok_or("role 'tool' requires tool_call_id")?;
+            if !pending.remove(id) {
+                return Err("role 'tool' references an unknown or duplicate tool_call_id".into());
+            }
+            text = json!({"tool_call_id":id,"output":text}).to_string();
+        } else if !pending.is_empty() {
+            return Err("Missing results for preceding tool calls".into());
+        }
+        if let Some(calls) = message.get("tool_calls") {
+            if role != "assistant" {
+                return Err("tool_calls requires assistant role".into());
+            }
+            let calls = calls
+                .as_array()
+                .filter(|calls| !calls.is_empty())
+                .ok_or("tool_calls must be a nonempty array")?;
+            for call in calls {
+                let id = call["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .ok_or("Tool call id required")?;
+                let arguments = call["function"]["arguments"]
+                    .as_str()
+                    .ok_or("Tool arguments must be a JSON string")?;
+                let arguments: Value =
+                    serde_json::from_str(arguments).map_err(|_| "Invalid tool argument JSON")?;
+                if call["type"] != "function"
+                    || call["function"]["name"].as_str().is_none()
+                    || !arguments.is_object()
+                    || !pending.insert(id.to_string())
+                {
+                    return Err("Invalid assistant tool call".into());
+                }
+            }
+            text.push_str(&format!("\nTool calls: {}", json!(calls)));
+        }
+        if role != "system" && role != "developer" {
+            let label = match role {
+                "user" => "User",
+                "tool" => "Tool result",
+                _ => "Assistant",
+            };
+            turns.push((label, text));
+        }
+    }
+    if messages.is_empty() {
         return Err("A non-empty user message is required".into());
+    }
+    if !pending.is_empty() {
+        return Err("Missing results for assistant tool calls".into());
+    }
+    if messages[messages.len() - 1]["role"] != "user"
+        && messages[messages.len() - 1]["role"] != "tool"
+    {
+        return Err("the last message must be from the user or a tool result".into());
+    }
+    if turns.len() == 1 {
+        let text = turns.remove(0).1;
+        if text.len() > MAX_BODY {
+            return Err("ACP prompt exceeds 1 MiB after flattening the conversation".into());
+        }
+        return Ok(text);
+    }
+    let turns = turns
+        .into_iter()
+        .map(|(label, text)| format!("{label}: {text}"));
+    let text = turns.collect::<Vec<_>>().join("\n\n");
+    if text.len() > MAX_BODY {
+        return Err("ACP prompt exceeds 1 MiB after flattening the conversation".into());
+    }
+    Ok(text)
+}
+
+pub(super) fn parse_completion(value: &Value, models: &[AcpModel]) -> Result<Completion, String> {
+    let object = value.as_object().ok_or("Request body must be an object")?;
+    for key in object.keys() {
+        if key == "service_tier" {
+            return Err("ACP text access does not support parameter 'service_tier': the model list does not advertise a service tier mapping".into());
+        }
+        if ![
+            "model",
+            "messages",
+            "stream",
+            "stream_options",
+            "reasoning_effort",
+            "reasoning",
+            "thinking",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "n",
+            "store",
+            "user",
+            "metadata",
+            "response_format",
+            "prompt_cache_key",
+            "safety_identifier",
+            "max_tokens",
+            "max_completion_tokens",
+            "temperature",
+            "top_p",
+        ]
+        .contains(&key.as_str())
+        {
+            return Err(format!(
+                "ACP text access does not support parameter '{key}'"
+            ));
+        }
+    }
+    let ignored_parameters = compatibility_parameters(value)?;
+    let mut tools = match value.get("tools") {
+        None | Some(Value::Null) => &[][..],
+        Some(Value::Array(tools)) => tools.as_slice(),
+        _ => return Err("tools must be an array".into()),
+    };
+    let choice = value.get("tool_choice").filter(|choice| !choice.is_null());
+    let disabled = choice.is_some_and(|choice| choice == "none");
+    if disabled {
+        tools = &[];
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for tool in tools {
+        let f = &tool["function"];
+        let name = f["name"].as_str().ok_or("Tool function name required")?;
+        if tool["type"] != "function"
+            || name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            || !names.insert(name)
+        {
+            return Err("Invalid or duplicate function tool".into());
+        }
+        if f.get("parameters").is_some_and(|v| !v.is_object()) {
+            return Err("Tool parameters must be a schema object".into());
+        }
+        if f["strict"] == true {
+            return Err("ACP does not enforce strict tool schemas".into());
+        }
+    }
+    if choice.is_some_and(|choice| choice != "none" && choice != "auto") {
+        return Err("tool_choice requires a supported client tool; ACP currently accepts only 'none' or 'auto' with no tools".into());
+    }
+    if value
+        .get("parallel_tool_calls")
+        .is_some_and(|v| !v.is_null() && !v.is_boolean())
+    {
+        return Err("parallel_tool_calls must be a boolean".into());
+    }
+    if value
+        .get("n")
+        .is_some_and(|v| !v.is_null() && v.as_u64() != Some(1))
+    {
+        return Err("ACP supports n: 1 only".into());
+    }
+    if value
+        .get("store")
+        .is_some_and(|v| !v.is_null() && v != false)
+    {
+        return Err("ACP does not store API completions; use store: false".into());
+    }
+    if value
+        .get("response_format")
+        .is_some_and(|v| !v.is_null() && v != &json!({"type":"text"}))
+    {
+        return Err("ACP does not expose structured output controls".into());
+    }
+    for key in ["user", "prompt_cache_key", "safety_identifier"] {
+        if value
+            .get(key)
+            .is_some_and(|v| !v.is_null() && !v.is_string())
+        {
+            return Err(format!("{key} must be a string"));
+        }
+    }
+    if value
+        .get("metadata")
+        .is_some_and(|v| !v.is_null() && !v.is_object())
+    {
+        return Err("metadata must be an object".into());
+    }
+    let requested = value["model"].as_str().ok_or("model is required")?;
+    let model = requested.strip_prefix("acp/").unwrap_or(requested);
+    let model = models
+        .iter()
+        .find(|item| item.id == model)
+        .ok_or("Unknown ACP model; refresh available models")?;
+    let mut effort = value
+        .get("reasoning_effort")
+        .map(|value| value.as_str().ok_or("reasoning_effort must be a string"))
+        .transpose()?;
+    for key in ["reasoning", "thinking"] {
+        if let Some(value) = value.get(key) {
+            let options = value.as_object().ok_or_else(|| {
+                format!("{key} must be an object containing only a string effort")
+            })?;
+            if options.len() != 1 || !options.contains_key("effort") {
+                return Err(format!(
+                    "ACP supports only {key}.effort; other {key} controls are not supported"
+                ));
+            }
+            let nested = options["effort"]
+                .as_str()
+                .ok_or_else(|| format!("{key}.effort must be a string"))?;
+            if effort.is_some_and(|effort| effort != nested) {
+                return Err("Conflicting ACP reasoning efforts".into());
+            }
+            effort = Some(nested);
+        }
+    }
+    let selected = match effort {
+        Some(effort) if model.reasoning_levels.is_empty() => {
+            return Err(format!("ACP model '{}' does not advertise reasoning levels; cannot request effort '{effort}'", model.id));
+        }
+        Some(effort) => model.reasoning_variants.get(effort).ok_or_else(|| {
+            format!(
+                "Unsupported reasoning effort '{effort}' for ACP model '{}'; supported levels: {}",
+                model.id,
+                model.reasoning_levels.join(", ")
+            )
+        })?,
+        None => &model.id,
+    };
+    let messages = value["messages"]
+        .as_array()
+        .ok_or("messages must be an array")?;
+    let text = prompt_text(messages)?;
+    let results: Vec<_> = messages
+        .iter()
+        .rev()
+        .take_while(|message| message["role"] == "tool")
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let system = messages
+        .iter()
+        .filter(|message| message["role"] == "system" || message["role"] == "developer")
+        .map(|message| message_text(message, message["role"].as_str().unwrap()))
+        .collect::<Result<Vec<_>, _>>()?
+        .join("\n\n");
+    if text.len().saturating_add(system.len()) > MAX_BODY {
+        return Err("ACP prompt and system instructions exceed 1 MiB".into());
     }
     let stream = match value.get("stream") {
         None => false,
@@ -383,9 +882,15 @@ fn parse_completion(value: &Value, models: &[AcpModel]) -> Result<Completion, St
         }
     }
     Ok(Completion {
-        model: model.into(),
+        model: selected.into(),
+        alias: format!("acp/{}", model.id),
         text,
+        system,
         stream,
+        ignored_parameters,
+        tools: tools.to_vec(),
+        messages: messages.clone(),
+        results,
     })
 }
 
@@ -397,7 +902,7 @@ fn complete<F: FnMut(&str)>(
     mut chunk: F,
 ) -> Result<String, String> {
     client.initialize(cancel)?;
-    let session = client.session(profile, cancel)?;
+    let session = client.session_with_system(profile, &request.system, cancel)?;
     client.model(&session, &request.model, cancel)?;
     let mut text = String::new();
     let mut oversized = false;
@@ -543,7 +1048,14 @@ async fn handle_inner<R: tauri::Runtime>(
     };
     let cancel = CancelOnDrop(guard.cancel.clone());
     let stream = request.stream;
-    let model = format!("acp/{}", request.model);
+    let ignored_parameters = request.ignored_parameters.clone();
+    if !ignored_parameters.is_empty() {
+        eprintln!(
+            "ACP compatibility: CLI defaults used; parameters not applied: {}",
+            ignored_parameters.join(", ")
+        );
+    }
+    let model = request.alias.clone();
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -552,48 +1064,121 @@ async fn handle_inner<R: tauri::Runtime>(
         "chatcmpl-acp-{created}-{}",
         NEXT_ID.fetch_add(1, Ordering::Relaxed)
     );
-    let (sender, receiver) = tokio::sync::mpsc::channel::<String>(64);
-    let stream_id = id.clone();
-    let stream_model = model.clone();
+    let agent_identity = json!({"profile":profile,"model":request.model,"system":request.system,"tools":request.tools});
+    let resumed = if !request.results.is_empty() {
+        match state.agents.resume(&request, &agent_identity) {
+            Ok(session) => session,
+            Err(error_message) => return error(StatusCode::BAD_REQUEST, error_message),
+        }
+    } else {
+        None
+    };
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+    let mut events = CompletionStream {
+        sender,
+        cancel: guard.cancel.clone(),
+        id: id.clone(),
+        model: model.clone(),
+        created,
+        started: false,
+    };
+    let worker_app = app.clone();
     let worker = tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
-        let result = (|| {
-            let mut client = spawn(&executable, &profile, &proxy)?;
-            complete(&mut client, &profile, &request, &_guard.cancel, |part| {
+        let result: Result<Output, String> = (|| {
+            let mut send_text = |part: &str| {
                 if stream {
-                    let value = json!({"id":stream_id,"object":"chat.completion.chunk","created":created,"model":stream_model,"choices":[{"index":0,"delta":{"content":part},"finish_reason":null}]});
-                    // Reserve two slots for the terminal error/finish and DONE;
-                    // a stalled client must never block cancellation/cleanup.
-                    if sender.capacity() <= 2
-                        || sender.try_send(format!("data: {value}\n\n")).is_err()
-                    {
+                    if events.delta(json!({"content":part})).is_err() {
                         _guard.cancel.store(true, Ordering::Release);
                     }
                 }
-            })
+            };
+            if !request.tools.is_empty() || resumed.is_some() {
+                let state = worker_app.state::<AcpState>();
+                let session = match resumed {
+                    Some(session) => session,
+                    None => state.agents.start(
+                        &request,
+                        agent_identity,
+                        &executable,
+                        &profile,
+                        &proxy,
+                        spawn,
+                    )?,
+                };
+                let output =
+                    state
+                        .agents
+                        .collect(&session, &request, &_guard.cancel, &mut send_text)?;
+                if stream && !output.calls.is_empty() {
+                    let calls: Vec<_> = output
+                        .calls
+                        .iter()
+                        .enumerate()
+                        .map(|(index, call)| {
+                            let mut call = call.clone();
+                            call["index"] = json!(index);
+                            call
+                        })
+                        .collect();
+                    events.delta(json!({"tool_calls":calls}))?;
+                }
+                Ok(output)
+            } else {
+                let mut client = spawn(&executable, &profile, &proxy)?;
+                let text = complete(&mut client, &profile, &request, &_guard.cancel, send_text)?;
+                Ok(Output {
+                    text,
+                    calls: Vec::new(),
+                })
+            }
         })();
         if stream {
-            let value = match &result {
-                Ok(_) => {
-                    json!({"id":stream_id,"object":"chat.completion.chunk","created":created,"model":stream_model,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})
+            match &result {
+                Ok(output) => {
+                    let _ = events.finish(output);
                 }
-                Err(error) => json!({"error":{"message":error,"type":"upstream_error"}}),
-            };
-            let _ = sender.try_send(format!("data: {value}\n\n"));
-            let _ = sender.try_send("data: [DONE]\n\n".into());
+                Err(error) => {
+                    let _ = events.send(Err(error.clone()));
+                }
+            }
         }
         result
     });
-    if stream {
-        let frames =
-            futures_util::stream::unfold((receiver, cancel), |(mut receiver, cancel)| async move {
-                receiver.recv().await.map(|data| {
+    let reply = if stream {
+        // Do not commit HTTP 200 until the upstream produces its first event.
+        // CPA can then handle startup failures through its existing HTTP error
+        // path rather than trying to translate them as completion chunks.
+        let first = match receiver.recv().await {
+            Some(Ok(frame)) => frame,
+            Some(Err(message)) => return error(upstream_status(&message), message),
+            None => return error(StatusCode::BAD_GATEWAY, "ACP worker exited unexpectedly"),
+        };
+        let frames = futures_util::stream::unfold(
+            (Some(first), receiver, cancel),
+            |(mut first, mut receiver, cancel)| async move {
+                let next = match first.take() {
+                    Some(frame) => Some(Ok(frame)),
+                    None => receiver.recv().await,
+                };
+                next.map(|data| {
+                    let data = match data {
+                        Ok(frame) => frame,
+                        Err(message) => {
+                            // An SSE error terminates the stream; never append
+                            // a success finish_reason or [DONE] after it.
+                            receiver.close();
+                            let value = json!({"error":{"message":message,"type":"upstream_error","code":upstream_status(&message).as_u16()}});
+                            format!("event: error\ndata: {value}\n\n")
+                        }
+                    };
                     (
                         Ok::<_, Infallible>(Frame::data(Bytes::from(data))),
-                        (receiver, cancel),
+                        (None, receiver, cancel),
                     )
                 })
-            });
+            },
+        );
         Response::builder()
             .header("content-type", "text/event-stream")
             .header("cache-control", "no-cache")
@@ -603,21 +1188,15 @@ async fn handle_inner<R: tauri::Runtime>(
         let result = worker.await;
         drop(cancel);
         match result {
-            Ok(Ok(text)) => response(
+            Ok(Ok(output)) => response(
                 StatusCode::OK,
-                json!({"id":id,"object":"chat.completion","created":created,"model":model,"choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}]}),
+                json!({"id":id,"object":"chat.completion","created":created,"model":model,"choices":[{"index":0,"message":output.message(),"finish_reason":output.finish(),"logprobs":null}]}),
             ),
-            Ok(Err(e)) => error(
-                if e.contains("timed out") {
-                    StatusCode::GATEWAY_TIMEOUT
-                } else {
-                    StatusCode::BAD_GATEWAY
-                },
-                e,
-            ),
+            Ok(Err(e)) => error(upstream_status(&e), e),
             Err(_) => error(StatusCode::BAD_GATEWAY, "ACP worker exited unexpectedly"),
         }
-    }
+    };
+    compatibility_headers(reply, &ignored_parameters)
 }
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);

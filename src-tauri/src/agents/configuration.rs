@@ -419,9 +419,7 @@ where
         .filter(|content| !content.is_empty())
         .map(|_| existing.unwrap_or_default())
         .unwrap_or("{}\n");
-    let mut document = yaml_serde_edit::YamlValue::parse(source)
-        .map_err(|error| format!("Invalid {label} YAML format: {error}"))?;
-    render_updated_core_yaml(&mut document, updated)
+    render_updated_core_yaml(source, updated)
         .map_err(|error| format!("Failed to update {label}: {error}"))
 }
 
@@ -495,12 +493,27 @@ where
         .filter(|content| !content.is_empty())
         .map(|_| existing.unwrap_or_default())
         .unwrap_or("[]\n");
-    if let Ok(mut document) = yaml_serde_edit::YamlValue::parse(source) {
-        document.set(updated.clone());
-        let rendered = document.get_string();
-        if let Ok(validated) = serde_norway::from_str::<serde_norway::Value>(&rendered) {
-            if validated == updated {
-                return Ok(rendered);
+    if let (Ok(file), serde_norway::Value::Sequence(values)) = (source.parse::<yaml_edit::YamlFile>(), &updated) {
+        if let Some(sequence) = file.document().and_then(|document| document.as_sequence()) {
+            if let Ok(nodes) = values.iter().map(yaml_edit_node_from_value).collect::<Result<Vec<_>, _>>() {
+                for (index, node) in nodes.into_iter().enumerate() {
+                    if index < sequence.len() {
+                        if original[index] != values[index] {
+                            sequence.set(index, node);
+                        }
+                    } else {
+                        sequence.push(node);
+                    }
+                }
+                for index in (values.len()..sequence.len()).rev() {
+                    sequence.remove(index);
+                }
+                let rendered = file.to_string();
+                if let Ok(validated) = serde_norway::from_str::<serde_norway::Value>(&rendered) {
+                    if validated == updated {
+                        return Ok(rendered);
+                    }
+                }
             }
         }
     }
@@ -1402,55 +1415,12 @@ pub(crate) fn claude_desktop_inference_model(
     if let Some(tier) = claude_desktop_family_tier(route_model) {
         entry.insert("anthropicFamilyTier".to_string(), serde_json::json!(tier));
         entry.insert("isFamilyDefault".to_string(), serde_json::json!(true));
-        let listed = if use_source { source_model } else { route_model };
-        if !is_recognized_claude_model_id(listed) {
-            if let Some(behaves_as) = claude_desktop_behaves_as(tier) {
-                entry.insert("behavesAs".to_string(), serde_json::json!(behaves_as));
-            }
-        }
     }
     if enable_1m {
         entry.insert("supports1m".to_string(), serde_json::json!(true));
         entry.insert("prefer1m".to_string(), serde_json::json!(true));
     }
     serde_json::Value::Object(entry)
-}
-
-// Claude Desktop resolves a listed model's effort levels by looking the
-// behavesAs id up in its own table (eyn in its app.asar), keyed on the
-// lowercased id with a date suffix and an "anthropic." prefix removed.
-// These are that table's keys: opus 5, sonnet 5 and fable 5.1 report the
-// full low/medium/high/xhigh/max ladder, while haiku 4.5 reports thinking
-// modes and no effort ladder at all. An id the table has no entry for gets
-// no effort picker, so a "newer" sounding name such as claude-opus-5-5 is
-// worse than useless here. A route that is already a real Claude model
-// needs no mapping, and older Desktop builds ignore the key.
-pub(crate) fn claude_desktop_behaves_as(tier: &str) -> Option<&'static str> {
-    match tier {
-        "opus" => Some("claude-opus-5"),
-        "sonnet" => Some("claude-sonnet-5"),
-        "haiku" => Some("claude-haiku-4-5"),
-        "fable" => Some("claude-fable-5-1"),
-        _ => None,
-    }
-}
-
-// A Claude model id Desktop and Claude Code both recognize:
-// claude-<tier>-<digits>(-<digits>)*. Our generated route ids carry a
-// trailing word (`claude-opus-5-cpa`), which is not recognized.
-fn is_recognized_claude_model_id(name: &str) -> bool {
-    let lowered = name.trim().to_ascii_lowercase();
-    let Some(rest) = lowered.strip_prefix("claude-") else { return false };
-    let mut parts = rest.split('-');
-    let Some(tier) = parts.next() else { return false };
-    if !matches!(tier, "opus" | "sonnet" | "haiku" | "fable" | "mythos") {
-        return false;
-    }
-    let Some(version) = parts.next() else { return false };
-    if version.is_empty() || !version.chars().all(|c| c.is_ascii_digit()) {
-        return false;
-    }
-    parts.all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
 }
 
 pub(crate) fn claude_desktop_family_tier(route_model: &str) -> Option<&'static str> {
@@ -2136,9 +2106,8 @@ pub(crate) fn prepare_hermes_managed_removal(paths: &[PathBuf]) -> Result<Images
     }
     let content = fs::read_to_string(path)
         .map_err(|error| format!("Failed to read Hermes configuration {}: {error}", path_to_string(path)))?;
-    let mut document = yaml_serde_edit::YamlValue::parse(&content)
+    let mut updated = serde_norway::from_str::<serde_norway::Value>(&content)
         .map_err(|error| format!("Failed to parse Hermes configuration: {error}"))?;
-    let mut updated = document.get().clone();
     let root = updated
         .as_mapping_mut()
         .ok_or_else(|| "Hermes configuration root must be a mapping".to_string())?;
@@ -2186,7 +2155,7 @@ pub(crate) fn prepare_hermes_managed_removal(paths: &[PathBuf]) -> Result<Images
     let bytes = if root.is_empty() {
         None
     } else {
-        Some(render_updated_core_yaml(&mut document, updated)?.into_bytes())
+        Some(render_updated_core_yaml(&content, updated)?.into_bytes())
     };
     Ok(vec![(path.clone(), bytes)])
 }
@@ -3106,9 +3075,8 @@ pub(crate) fn build_restored_hermes_config(
     current: &str,
     original: Option<&str>,
 ) -> Result<Option<String>, String> {
-    let mut document = yaml_serde_edit::YamlValue::parse(current)
+    let mut updated = serde_norway::from_str::<serde_norway::Value>(current)
         .map_err(|error| format!("Invalid current Hermes configuration format: {error}"))?;
-    let mut updated = document.get().clone();
     let root = updated
         .as_mapping_mut()
         .ok_or_else(|| "Current Hermes configuration root must be a mapping".to_string())?;
@@ -3189,7 +3157,7 @@ pub(crate) fn build_restored_hermes_config(
     if root.is_empty() && original.is_none() {
         return Ok(None);
     }
-    render_updated_core_yaml(&mut document, updated).map(Some)
+    render_updated_core_yaml(current, updated).map(Some)
 }
 
 pub(crate) fn restore_deepseek_harness_provider(

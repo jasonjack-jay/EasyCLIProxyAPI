@@ -3,6 +3,7 @@ import { ArrowRight, ChevronDown, CircleCheck, Code2, Copy, ExternalLink, KeyRou
 import antigravityIcon from '../assets/icons/antigravity.svg';
 import { Notice } from '../components/Notice';
 import { Select } from '../components/Select';
+import { Switch } from '../components/Switch';
 import { useI18n } from '../i18n';
 import { usePrivacyMask } from '../privacy';
 import { acpApi, type AcpStatus } from '../services/acp';
@@ -71,6 +72,20 @@ export function AcpAccessPage() {
   const connected = status?.authenticated === true;
   const hasCli = Boolean(status?.executable);
   const apiEnabled = status?.upstreamEnabled === true;
+  const apiReady = apiEnabled && connected && Boolean(status?.upstreamUrl);
+  const apiSwitchOperation = activeOperation === 'upstream';
+  const apiCanStart = connected && Boolean(status?.models.length);
+  // Stopping stays available whenever access is on, regardless of connection state.
+  const apiSwitchDisabled = apiSwitchOperation || (!apiEnabled && (!apiCanStart || loading));
+  const apiSwitchHint = busy && !apiSwitchOperation
+    ? t('acp.apiSwitchWaiting', { label: busyLabel })
+    : !apiEnabled && !apiCanStart
+      ? t(loading ? 'acp.apiSwitchChecking' : 'acp.apiSwitchNeedsAccount')
+      : !apiEnabled && apiCanStart
+        ? t('acp.apiSwitchStartHint')
+        : apiEnabled && !apiReady
+          ? t('acp.apiSwitchWaitingConnection')
+          : t('acp.apiSwitchStopHint');
   const awaitingFirstConnection = !connected && status?.activeAccount === 'default'
     && status.accounts.length === 1 && status.accounts[0].label === 'Default' && !status.accounts[0].email;
   const shownError = error || status?.error;
@@ -165,24 +180,32 @@ export function AcpAccessPage() {
       </> : <div className="acp-empty-state"><span className="acp-empty-icon"><LockKeyhole size={20} aria-hidden="true" /></span><strong>{t('acp.modelsLocked')}</strong><p>{t('acp.emptyModels')}</p><button type="button" className="secondary-button" disabled><Zap size={15} aria-hidden="true" />{t('acp.test')}</button></div>}
     </section>
 
-    <section className="panel surface-panel acp-model-card acp-api-card" aria-labelledby="acp-api-title">
-      <div className="acp-section-heading"><div className="acp-section-identity"><span className="acp-section-icon"><Code2 size={17} aria-hidden="true" /></span><div><h2 id="acp-api-title">{t('acp.apiTitle')}</h2><p className="acp-muted">{t('acp.apiDescription')}</p></div></div><span className="acp-connection-status" role="status" data-connected={apiEnabled && connected}><span className="acp-status-dot" data-ready={apiEnabled && connected} aria-hidden="true" />{t(apiEnabled ? connected ? 'acp.apiEnabled' : 'acp.apiWaiting' : 'acp.apiDisabled')}</span></div>
-      {connected || apiEnabled ? <><p className="acp-muted">{t(apiEnabled && !connected ? 'acp.apiReconnectHint' : 'acp.apiHint')}</p>
-      <div className="acp-api-enable-row">{connected ? <div className="acp-api-summary"><span className="acp-model-total">{status.models.length}</span><div><strong>{t('acp.apiModelsTitle')}</strong><span>{t('acp.apiModelsHint')}</span></div></div> : null}
-      <div className="acp-provider-actions"><button type="button" className={apiEnabled ? 'secondary-button' : 'primary-button'}
-        disabled={busy || loading || (!status?.upstreamEnabled && !connected)}
-        onClick={() => void run('upstream', () => acpApi.setUpstreamEnabled(!status?.upstreamEnabled))}>
-        {apiEnabled ? <Unplug size={15} aria-hidden="true" /> : <ArrowRight size={15} aria-hidden="true" />}{t(status?.upstreamEnabled ? 'acp.disableApi' : 'acp.enableApi')}
-      </button></div></div>
-      </> : <div className="acp-empty-state"><span className="acp-empty-icon"><Code2 size={20} aria-hidden="true" /></span><strong>{t('acp.apiLocked')}</strong><p>{t('acp.apiLockedHint')}</p><button type="button" className="secondary-button" disabled><ArrowRight size={15} aria-hidden="true" />{t('acp.enableApi')}</button></div>}
-      {apiEnabled && connected ? <details className="acp-api-details"><summary>{t('acp.apiUsageTitle')}<ChevronDown size={14} aria-hidden="true" /></summary><div className="acp-api-details-body">
+    <section className="panel surface-panel acp-model-card acp-api-card" aria-labelledby="acp-api-title" data-enabled={apiReady}>
+      <div className="acp-section-heading"><div className="acp-section-identity"><span className="acp-section-icon"><Code2 size={17} aria-hidden="true" /></span><div><h2 id="acp-api-title">{t('acp.apiTitle')}</h2><p className="acp-muted">{t('acp.apiDescription')}</p></div></div><span className="acp-connection-status" role="status" data-connected={apiReady}><span className="acp-status-dot" data-ready={apiReady} aria-hidden="true" />{t(apiSwitchOperation ? 'acp.apiStateStarting'
+        : apiEnabled ? apiReady ? 'acp.apiStateOn' : 'acp.apiStateWaiting'
+        : 'acp.apiStateOff')}</span></div>
+      <label className="acp-api-switch">
+        <Switch checked={apiEnabled} disabled={apiSwitchDisabled} title={t(apiEnabled ? 'acp.apiSwitchOffLabel' : 'acp.apiSwitchOnLabel')}
+          aria-describedby="acp-api-switch-hint"
+          onChange={event => { const enabled = event.currentTarget.checked; if (enabled === apiEnabled) return; void run('upstream', () => acpApi.setUpstreamEnabled(enabled)); }} />
+        <span className="acp-api-switch-text"><strong>{t(apiEnabled ? 'acp.apiSwitchOffLabel' : 'acp.apiSwitchOnLabel')}</strong>
+          <span className="acp-muted" id="acp-api-switch-hint">{apiSwitchHint}</span></span>
+        <span className="acp-api-switch-state" data-state={apiSwitchOperation ? 'starting' : apiEnabled ? (apiReady ? 'on' : 'waiting') : 'off'}>
+          {apiSwitchOperation ? <LoaderCircle size={13} className="spin" aria-hidden="true" /> : null}{t(apiSwitchOperation ? 'acp.apiStateStarting'
+            : apiEnabled ? apiReady ? 'acp.apiStateOn' : 'acp.apiStateWaiting'
+            : 'acp.apiStateOff')}</span>
+      </label>
+      <div className="acp-api-enable-row">
+        <p className="acp-muted">{!apiEnabled && !apiCanStart ? t('acp.apiNeedsAccountHint') : t(apiEnabled && !apiReady ? 'acp.apiReconnectHint' : 'acp.apiHint')}</p>
+        {connected ? <div className="acp-api-summary"><span className="acp-model-total">{status.models.length}</span><div><strong>{t('acp.apiModelsTitle')}</strong><span>{t('acp.apiModelsHint')}</span></div></div> : null}
+      </div>
+      {apiReady ? <details className="acp-api-details"><summary>{t('acp.apiUsageTitle')}<ChevronDown size={14} aria-hidden="true" /></summary><div className="acp-api-details-body">
         <p className="acp-muted">{t('acp.apiUsage')}</p>
         <div className="acp-code-example"><div className="acp-code-heading"><span><b>POST</b><code>/v1/chat/completions</code></span>
         <button type="button" className="secondary-button compact-button" onClick={() => void navigator.clipboard.writeText(example).then(() => setCopied(true)).catch(cause => setError(String(cause)))}><Copy size={14} aria-hidden="true" />{t(copied ? 'acp.exampleCopied' : 'common.copy')}</button>
         </div><pre><code>{example}</code></pre></div>
         <details className="acp-api-model-list"><summary>{t('acp.models')} · {status.models.length}</summary><ul className="acp-api-models">{status.models.map(model => <li key={model.id}><code>{`acp/${model.id}`}</code></li>)}</ul></details>
       </div></details> : null}
-      <p className="acp-api-limits">{t('acp.apiLimitsShort')}</p>
     </section></div>
 
     <details className="acp-footnote"><summary><span><Settings2 size={15} aria-hidden="true" />{t('acp.connectionDetails')}</span><ChevronDown size={15} aria-hidden="true" /></summary><div className="acp-footnote-body">
@@ -192,7 +215,6 @@ export function AcpAccessPage() {
       {connected ? <div className="acp-relogin"><p>{t('acp.reloginHint')}</p><button type="button" className="secondary-button" disabled={busy || loading} onClick={() => void run('login', () => acpApi.reloginAccount())}><LogIn size={15} aria-hidden="true" />{t('acp.relogin')}</button></div> : null}
       <h3>{t('acp.profile')}</h3><p>{t('acp.profileHint')}</p>
       {status?.profile ? <code>{privacy.text(status.profile)}</code> : null}
-      <h3>{t('acp.capabilities')}</h3><p>{t('acp.capabilitiesHint')}</p>
     </div></details>
   </div>;
 }

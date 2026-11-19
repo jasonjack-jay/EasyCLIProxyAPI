@@ -3,10 +3,12 @@ import type { MessageKey } from './zh-CN';
 import { easyModeEn } from '../easyMode';
 import { homeEn } from '../home';
 import { authFileListEn } from '../authFileList';
+import { autoUpdateEn } from '../autoUpdate';
 import { themeDiyEn } from '../themeDiy';
 
 import { acpEn } from '../acp';
 export const en: Record<MessageKey, string> = {
+  ...autoUpdateEn,
   ...acpEn,
   'agents.responseLanguage.label': 'Response language',
   'agents.responseLanguage.unmanaged': 'Keep existing setting (unmanaged)',
@@ -2072,6 +2074,9 @@ export const en: Record<MessageKey, string> = {
   'apiAccess.health.checking': 'Checking…',
   'apiAccess.health.healthy': 'Healthy',
   'apiAccess.health.failed': 'Failed',
+  'apiAccess.health.budgetExhausted': 'Probe budget exhausted',
+  'apiAccess.health.budgetExhaustedDetail': 'Response received, but the generation budget was exhausted before a first body token could be measured.',
+  'apiAccess.health.budgetSummary': '{count} probe budgets exhausted',
   'apiAccess.health.noModel': 'No model is available for a health check',
   'apiAccess.health.timeout': 'The request timed out',
   'apiAccess.health.missingDirectKey': 'A directly usable plaintext API key is required to measure first-token latency',

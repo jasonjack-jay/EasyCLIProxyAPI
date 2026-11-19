@@ -1,6 +1,9 @@
 mod accounts;
 mod bridge;
 mod rpc;
+mod agent;
+mod tool_transport;
+pub(crate) use tool_transport::run_helper as run_mcp_helper;
 pub(crate) use bridge::restore;
 
 #[tauri::command]
@@ -13,6 +16,7 @@ pub(crate) async fn set_acp_upstream_enabled(
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -42,6 +46,10 @@ pub(crate) struct AcpStatus {
 pub(crate) struct AcpModel {
     id: String,
     name: String,
+    #[serde(default, rename = "reasoningLevels")]
+    reasoning_levels: Vec<String>,
+    #[serde(skip)]
+    reasoning_variants: BTreeMap<String, String>,
 }
 
 #[derive(Default)]
@@ -50,6 +58,7 @@ pub(crate) struct AcpState {
     cancel: Mutex<Option<Arc<AtomicBool>>>,
     bridge: Mutex<Option<bridge::Runtime>>,
     bridge_transition: tokio::sync::Mutex<()>,
+    agents: agent::Sessions,
 }
 
 impl AcpState {
@@ -63,6 +72,7 @@ impl AcpState {
 
     pub(crate) fn shutdown(&self) {
         self.cancel();
+        self.agents.clear();
         if let Ok(mut runtime) = self.bridge.lock() {
             runtime.take();
         }
@@ -104,8 +114,21 @@ fn read_selected(profile: &Path) -> Result<String, String> {
     }
 }
 
+const REASONING_LEVELS: &[&str] = &[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "auto",
+];
+
+fn model_variant(id: &str) -> (&str, Option<&str>) {
+    match id.rsplit_once('-') {
+        Some((base, level)) if !base.is_empty() && REASONING_LEVELS.contains(&level) => {
+            (base, Some(level))
+        }
+        _ => (id, None),
+    }
+}
+
 fn model_list(session: &Value) -> Vec<AcpModel> {
-    session["models"]["availableModels"]
+    let mut models: Vec<_> = session["models"]["availableModels"]
         .as_array()
         .into_iter()
         .flatten()
@@ -114,9 +137,37 @@ fn model_list(session: &Value) -> Vec<AcpModel> {
             Some(AcpModel {
                 id: id.to_string(),
                 name: model["name"].as_str().unwrap_or(id).to_string(),
+                reasoning_levels: Vec::new(),
+                reasoning_variants: BTreeMap::new(),
             })
         })
-        .collect()
+        .collect();
+    let mut groups: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    for model in &models {
+        let (base, level) = model_variant(&model.id);
+        if let Some(level) = level {
+            groups
+                .entry(base.to_string())
+                .or_default()
+                .insert(level.to_string(), model.id.clone());
+        }
+    }
+    for model in &models {
+        if let Some(variants) = groups.get_mut(model.id.as_str()) {
+            variants.insert("none".into(), model.id.clone());
+        }
+    }
+    for model in &mut models {
+        if let Some(variants) = groups.get(model_variant(&model.id).0) {
+            model.reasoning_levels = REASONING_LEVELS
+                .iter()
+                .filter(|level| variants.contains_key(**level))
+                .map(|level| level.to_string())
+                .collect();
+            model.reasoning_variants = variants.clone();
+        }
+    }
+    models
 }
 
 fn mark_session(state: &AcpState, session: &Value, profile: &Path) -> Result<(), String> {
@@ -152,6 +203,7 @@ pub(crate) fn get_acp_status(
     status.executable =
         crate::find_antigravity_cli(&home).map(|path| path.to_string_lossy().into_owned());
     let root = profile(&crate::core_base_dir()?);
+    status.upstream_enabled = bridge::upstream_enabled(&root)?;
     let accounts = accounts::read(&root)?;
     let profile = accounts::directory(&root, &accounts.active)?;
     status.active_account = accounts.active;
@@ -244,6 +296,7 @@ pub(crate) async fn relogin_acp_account(app: tauri::AppHandle) -> Result<AcpStat
 
 fn clear_account(app: &tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<AcpState>();
+    state.agents.clear();
     {
         let mut status = state.status.lock().map_err(|_| "ACP state unavailable")?;
         status.authenticated = false;
@@ -273,37 +326,15 @@ async fn connect(
         let state = app.state::<AcpState>();
         let result: Result<(), String> = (|| {
             prepare_profile(&profile)?;
-            if login {
-                accounts::set_active_email(&accounts_root, None)?;
-            }
             let mut client = rpc::Client::spawn(&executable, &profile, &proxy)?;
-            client.initialize(&guard.cancel)?;
-            if switch_account {
-                // Replace only this account profile through the official server.
-                client.logout(&guard.cancel)?;
-                {
-                    let mut status = state.status.lock().map_err(|_| "ACP state unavailable")?;
-                    status.authenticated = false;
-                    status.models.clear();
-                    status.selected_model.clear();
-                }
-                bridge::sync_models(state.inner())?;
-            }
-            if login {
-                // The official server owns the browser callback and credential persistence.
-                client.call(
-                    "authenticate",
-                    json!({"methodId":"oauth-personal"}),
-                    &guard.cancel,
-                    |_| {},
-                )?;
-            }
-            let session = client.session(&profile, &guard.cancel)?;
-            mark_session(state.inner(), &session, &profile)?;
-            // Identity is optional; a CLI log format change must not prevent
-            // otherwise valid model access. Persist only the extracted email.
-            let _ = accounts::set_active_email(&accounts_root, client.account_email(&profile));
-            bridge::sync_models(state.inner())
+            connect_session(
+                state.inner(),
+                &accounts_root,
+                login,
+                switch_account,
+                &guard.cancel,
+                &mut client,
+            )
         })();
         if let Err(error) = &result {
             if let Ok(mut status) = state.status.lock() {
@@ -320,6 +351,43 @@ async fn connect(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+fn connect_session(
+    state: &AcpState,
+    root: &Path,
+    login: bool,
+    switch_account: bool,
+    cancel: &Arc<AtomicBool>,
+    client: &mut rpc::Client,
+) -> Result<(), String> {
+    let profile = accounts::active(root)?;
+    if login {
+        accounts::set_active_email(root, None)?;
+    }
+    client.initialize(cancel)?;
+    if switch_account {
+        client.logout(cancel)?;
+        {
+            let mut status = state.status.lock().map_err(|_| "ACP state unavailable")?;
+            status.authenticated = false;
+            status.models.clear();
+            status.selected_model.clear();
+        }
+        bridge::sync_models(state)?;
+    }
+    if login {
+        client.call(
+            "authenticate",
+            json!({"methodId":"oauth-personal"}),
+            cancel,
+            |_| {},
+        )?;
+    }
+    let session = client.session(&profile, cancel)?;
+    mark_session(state, &session, &profile)?;
+    let _ = accounts::set_active_email(root, client.account_email(&profile));
+    bridge::sync_models(state)
 }
 
 #[tauri::command]

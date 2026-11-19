@@ -35,6 +35,7 @@ mod privacy_mode;
 mod progress;
 mod provider_health;
 mod reverse_proxy;
+mod auto_update;
 #[cfg(any(
     target_os = "linux",
     target_os = "macos",
@@ -214,11 +215,11 @@ const PI_AGENT_MODELS_CACHE_FILE: &str = "cliproxyapi-models.json";
 const CODEX_MODEL_CATALOG_FILE: &str = "cpa-gui-model-catalog.json";
 const CODEX_OAUTH_LOGIN_REQUIRED_ERROR: &str = "CODEX_OAUTH_LOGIN_REQUIRED";
 const CLAUDE_DESKTOP_PROFILE_ID: &str = "00000000-0000-4000-8000-000000831700";
-const CLAUDE_DESKTOP_OPUS_MODEL_ID: &str = "claude-opus-5-cpa";
-const CLAUDE_DESKTOP_SONNET_MODEL_ID: &str = "claude-sonnet-5-cpa";
-const CLAUDE_DESKTOP_HAIKU_MODEL_ID: &str = "claude-haiku-4-5-cpa";
+const CLAUDE_DESKTOP_OPUS_MODEL_ID: &str = "claude-opus-5";
+const CLAUDE_DESKTOP_SONNET_MODEL_ID: &str = "claude-sonnet-5";
+const CLAUDE_DESKTOP_HAIKU_MODEL_ID: &str = "claude-haiku-4-5";
 const LEGACY_CLAUDE_DESKTOP_MODEL_IDS: [&str; 3] =
-    ["claude-opus-5", "claude-sonnet-4-6", "claude-haiku-4-5"];
+    ["claude-opus-5-cpa", "claude-sonnet-5-cpa", "claude-haiku-4-5-cpa"];
 const MANAGED_CLAUDE_OPUS_ALIAS_DISPLAY_NAME: &str = "EasyCLIProxyAPI managed Claude Opus mapping";
 const MANAGED_CLAUDE_SONNET_ALIAS_DISPLAY_NAME: &str =
     "EasyCLIProxyAPI managed Claude Sonnet mapping";
@@ -301,6 +302,7 @@ fn normalize_app_locale(locale: &str) -> &'static str {
 #[derive(Default)]
 struct CoreDownloadState {
     inner: Mutex<CoreDownloadInner>,
+    silent: bool,
 }
 
 #[derive(Default)]
@@ -550,6 +552,8 @@ struct PendingAppUpdate {
 #[serde(rename_all = "camelCase")]
 struct AppUpdateTask {
     running: bool,
+    #[serde(skip)]
+    automatic: bool,
     preserve_core: bool,
     cancellable: bool,
     phase: String,
@@ -567,6 +571,7 @@ impl Default for AppUpdateTask {
             cancellable: false,
             phase: "idle".to_string(),
             preserve_core: false,
+            automatic: false,
             target_version: None,
             downloaded_bytes: 0,
             total_bytes: None,
@@ -583,7 +588,7 @@ struct PortablePackagePayload {
 }
 
 #[cfg(any(windows, target_os = "linux"))]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PortableUpdateDescriptor {
     parent_pid: u32,
@@ -607,7 +612,7 @@ struct PortableUpdateDescriptor {
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MacosUpdateDescriptor {
     parent_pid: u32,
@@ -679,6 +684,7 @@ struct GuiConfigFile {
     #[serde(default = "default_update_channel")]
     update_channel: String,
     commercial_mode: bool,
+    auto_update: auto_update::AutoUpdateSettings,
     logging_to_file: bool,
     logs_max_total_size_mb: u32,
     error_logs_max_files: u32,
@@ -984,6 +990,7 @@ impl Default for GuiConfigFile {
             management_secret_key: LEGACY_DEFAULT_MANAGEMENT_SECRET_KEY.to_string(),
             debug: false,
             update_channel: default_update_channel(),
+            auto_update: auto_update::AutoUpdateSettings::default(),
             commercial_mode: false,
             logging_to_file: false,
             logs_max_total_size_mb: DEFAULT_LOGS_MAX_TOTAL_SIZE_MB,
@@ -1792,6 +1799,9 @@ struct DownloadedArchive {
 }
 
 impl CoreDownloadState {
+    fn silent() -> Self {
+        Self { silent: true, ..Self::default() }
+    }
     fn start(&self, token: CancellationToken, version: Option<String>) -> Result<(), String> {
         let mut inner = self
             .inner
@@ -1843,6 +1853,9 @@ impl CoreDownloadState {
         total: Option<u64>,
         cancellable: bool,
     ) {
+        if self.silent {
+            return;
+        }
         let percent = total
             .filter(|total| *total > 0)
             .map(|total| downloaded as f64 * 100.0 / total as f64);
@@ -1956,6 +1969,7 @@ impl AppUpdateState {
             cancellable: true,
             phase: "downloading".to_string(),
             preserve_core: inner.task.preserve_core,
+            automatic: inner.task.automatic,
             target_version: Some(pending.version.clone()),
             downloaded_bytes: 0,
             total_bytes: Some(pending.asset.size_bytes),
@@ -2542,6 +2556,11 @@ struct GithubAsset {
 
 fn main() {
     let helper_args = env::args_os().collect::<Vec<_>>();
+    if helper_args.get(1).is_some_and(|arg| arg == "--cpa-acp-tools") {
+        let result = acp::run_mcp_helper();
+        if let Err(error) = result { eprintln!("{error}"); std::process::exit(1); }
+        return;
+    }
     if helper_args.get(1).is_some_and(|a| a == "--cpa-copilot-cli") {
         let code = run_copilot_helper(&helper_args).unwrap_or_else(|error| { eprintln!("{error}"); 1 });
         std::process::exit(code);
@@ -2633,6 +2652,7 @@ fn main() {
         .manage(CoreDownloadState::default())
         .manage(acp::AcpState::default())
         .manage(AppUpdateState::default())
+        .manage(auto_update::AutoUpdateState::default())
         .manage(window_activity::WindowActivity::default())
         .manage(CoreProcessState::new(should_start_core_on_launch(
             &gui_config,
@@ -2879,7 +2899,23 @@ fn main() {
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
-                } else if should_start_core_on_launch(&config) {
+                }
+                // Adopt a preserved core before a cached update can replace it.
+                // Release the lifecycle lock: installation takes it itself.
+                drop(_guard);
+                if runtime_update_ack.is_none()
+                    && tauri::async_runtime::block_on(auto_update::startup(&core_app))
+                {
+                    return;
+                }
+                let Ok(_guard) = CORE_OPERATION_LOCK.lock() else {
+                    return;
+                };
+                let Ok(config) = gui_config_state.snapshot() else {
+                    process_state.set_starting(false);
+                    return;
+                };
+                if process_state.managed_pid().is_none() && should_start_core_on_launch(&config) {
                     let start_result = retry_core_operation(3, Duration::from_millis(400), || {
                         process_state.ensure_active()?;
                         start_core_process_inner(process_state.inner(), &config)
@@ -2923,8 +2959,10 @@ fn main() {
                         core_expected,
                     ) {
                         eprintln!("Application update runtime acceptance failed: {error}");
+                        return;
                     }
                 }
+                tauri::async_runtime::spawn(auto_update::run(core_app.clone()));
             });
 
             Ok(())
@@ -3093,6 +3131,9 @@ fn main() {
             get_app_update_task,
             start_app_update,
             cancel_app_update,
+            auto_update::get_auto_update_status,
+            auto_update::set_auto_update_settings,
+            auto_update::retry_auto_update,
             check_latest_core,
             core_runtime::list_core_versions,
             detect_bundled_core,
@@ -3156,6 +3197,7 @@ fn main() {
                 eprintln!("Failed to save main window geometry: {error}");
             }
             app_handle.state::<CoreDownloadState>().cancel();
+            app_handle.state::<auto_update::AutoUpdateState>().shutdown();
             let app_handle = app_handle.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 let _guard = CORE_OPERATION_LOCK
