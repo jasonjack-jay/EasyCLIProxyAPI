@@ -1248,27 +1248,6 @@ pub(crate) fn release_tag_from_url(url: &reqwest::Url) -> Option<String> {
     }
 }
 
-pub(crate) fn is_app_update_available(current: &str, latest: &str) -> Result<bool, String> {
-    let parse = |value: &str| {
-        semver::Version::parse(value.trim().trim_start_matches('v'))
-            .map_err(|error| format!("Failed to parse version {value}: {error}"))
-    };
-    let current_version = parse(current)?;
-    let latest_version = parse(latest)?;
-    if latest_version > current_version {
-        return Ok(true);
-    }
-    // Allow updating from a prerelease / PR / dev build to a stable release with equal or greater base version
-    if !current_version.pre.is_empty()
-        && latest_version.pre.is_empty()
-        && (latest_version.major, latest_version.minor, latest_version.patch)
-            >= (current_version.major, current_version.minor, current_version.patch)
-    {
-        return Ok(true);
-    }
-    Ok(false)
-}
-
 #[cfg(test)]
 pub(crate) fn parse_release_assets(html: &str) -> Vec<GithubAsset> {
     let mut assets = Vec::new();
@@ -2134,6 +2113,10 @@ pub(crate) fn configure_networked_command(command: &mut Command, proxy_url: &str
 }
 
 pub(crate) fn stop_core_process_inner(process_state: &CoreProcessState) -> Result<(), String> {
+    stop_core_processes(process_state, true)
+}
+
+pub(crate) fn stop_core_processes(process_state: &CoreProcessState, include_untracked: bool) -> Result<(), String> {
     process_state.recovery.cancel();
     let mut stopped_any = false;
     let mut errors = Vec::new();
@@ -2155,7 +2138,7 @@ pub(crate) fn stop_core_process_inner(process_state: &CoreProcessState) -> Resul
         })
         .map(|process| process.process_id)
         .collect::<Vec<_>>();
-    if let Ok(install_dir) = core_install_dir() {
+    if let Some(install_dir) = include_untracked.then(core_install_dir).and_then(Result::ok) {
         if let Some(binary_path) = find_core_binary(&install_dir) {
             process_ids.extend(find_core_process_ids(&binary_path));
         }
@@ -2175,7 +2158,7 @@ pub(crate) fn stop_core_process_inner(process_state: &CoreProcessState) -> Resul
 
     if !errors.is_empty() {
         Err(errors.join("；"))
-    } else if stopped_any {
+    } else if stopped_any || !include_untracked {
         Ok(())
     } else {
         Err("CPA kernel is not currently running".to_string())

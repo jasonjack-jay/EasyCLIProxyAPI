@@ -52,6 +52,11 @@ jobs:
     outputs:
       version: ${{ steps.resolve.outputs.version }}
       tag: ${{ steps.resolve.outputs.tag }}
+      release_family: ${{ steps.resolve.outputs.release_family }}
+      build_matrix: ${{ steps.matrix.outputs.matrix }}
+      is_preview: ${{ steps.matrix.outputs.is_preview }}
+      stable_series_version: ${{ steps.resolve.outputs.stable_series_version }}
+      preview_series_version: ${{ steps.resolve.outputs.preview_series_version }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -63,6 +68,7 @@ jobs:
         env:
           REQUESTED_VERSION: ${{ (github.ref_type == 'tag' && github.ref_name) || inputs.release_tag }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          MANUAL_PRERELEASE: ${{ inputs.prerelease }}
           MIAOMIAO_PREVIEW: ${{ inputs.preview }}
           EVENT_NAME: ${{ github.event_name }}
           REF_TYPE: ${{ github.ref_type }}
@@ -96,8 +102,13 @@ jobs:
             version="$(node scripts/version.mjs "${release_tag#v}")"
           elif [[ "$is_preview_run" == "true" ]]; then
             base_version="${source_version%%[-+]*}"
-            preview_stamp="$(node scripts/preview-tag.mjs --stamp)"
-            release_tag="preview-${preview_stamp}"
+            # A supplied timestamp identifies the exact source ref and authored notes.
+            if [[ "$release_tag" =~ ^preview-([0-9]{8}-[0-9]{4})$ ]]; then
+              preview_stamp="${BASH_REMATCH[1]}"
+            else
+              preview_stamp="$(node scripts/preview-tag.mjs --stamp)"
+              release_tag="preview-${preview_stamp}"
+            fi
             version="${base_version}-preview.${preview_stamp}"
           elif [ -z "$release_tag" ]; then
             release_tag="v$source_version"
@@ -119,8 +130,36 @@ jobs:
             fi
           fi
 
+          # A published package carries its own release identity plus the other series'
+          # source-pinned reference. Neither reference changes the package version.
+          release_family=unknown
+          stable_series_version=""
+          preview_series_version=""
+          if [[ "$version" =~ -preview($|[.+]) ]]; then
+            release_family=preview
+            if [[ "$version" =~ -preview\.([0-9]{8}-[0-9]{4})$ ]]; then
+              preview_series_version="${BASH_REMATCH[1]}"
+            fi
+            stable_series_version="$(node scripts/app-version-anchors.mjs stable)"
+          elif [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
+            { [[ "$ref_type" == "tag" ]] ||
+              [[ "$event_name" == "workflow_dispatch" && -n "$REQUESTED_VERSION" && "${MANUAL_PRERELEASE:-true}" == "false" ]]; }; then
+            release_family=stable
+            stable_series_version="$version"
+            preview_series_version="$(node scripts/app-version-anchors.mjs preview)"
+          fi
+          echo "release_family=$release_family" >> "$GITHUB_OUTPUT"
+          echo "stable_series_version=$stable_series_version" >> "$GITHUB_OUTPUT"
+          echo "preview_series_version=$preview_series_version" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
+      - name: Resolve build matrix
+        id: matrix
+        env:
+          RESOLVED_VERSION: ${{ steps.resolve.outputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+          MIAOMIAO_PREVIEW: ${{ inputs.preview }}
+        run: node scripts/release-matrix.mjs >> "$GITHUB_OUTPUT"
 
   frontend:
     name: Build shared frontend
@@ -158,40 +197,7 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-22.04
-            os: linux
-            display_os: Linux
-            arch: amd64
-            suffix: tar.gz
-          - runner: ubuntu-22.04-arm
-            os: linux
-            display_os: Linux
-            arch: aarch64
-            suffix: tar.gz
-          - runner: macos-15
-            os: darwin
-            display_os: Darwin
-            arch: amd64
-            suffix: dmg
-            rust_target: x86_64-apple-darwin
-          - runner: macos-15
-            os: darwin
-            display_os: Darwin
-            arch: aarch64
-            suffix: dmg
-            rust_target: aarch64-apple-darwin
-          - runner: windows-2025
-            os: windows
-            display_os: Windows
-            arch: amd64
-            suffix: zip
-          - runner: windows-11-arm
-            os: windows
-            display_os: Windows
-            arch: aarch64
-            suffix: zip
+      matrix: ${{ fromJSON(needs.version.outputs.build_matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
@@ -276,6 +282,9 @@ jobs:
           path: dist
       - name: Build GUI
         env:
+          ECPA_RELEASE_FAMILY: ${{ needs.version.outputs.release_family }}
+          ECPA_STABLE_SERIES_VERSION: ${{ needs.version.outputs.stable_series_version || 'unknown' }}
+          ECPA_PREVIEW_SERIES_VERSION: ${{ needs.version.outputs.preview_series_version || 'unknown' }}
           GITCODE_GUI_REPOSITORY: ${{ vars.GITCODE_GUI_REPOSITORY }}
           GITCODE_CORE_REPOSITORY: ${{ vars.GITCODE_CORE_REPOSITORY }}
         run: |
@@ -516,6 +525,7 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ needs.version.outputs.tag }}
+          IS_PREVIEW: ${{ needs.version.outputs.is_preview }}
         run: |
           set -euo pipefail
           if ! node scripts/version.mjs "${RELEASE_TAG#v}" >/dev/null 2>&1 \
@@ -524,7 +534,11 @@ jobs:
             echo "Skipping portable update manifests for non-semver release tag: $RELEASE_TAG"
             exit 0
           fi
-          for platform in windows linux darwin; do
+          platforms=(windows linux darwin)
+          if [[ "$IS_PREVIEW" == "true" ]]; then
+            platforms=(windows)
+          fi
+          for platform in "${platforms[@]}"; do
             node scripts/manifest.mjs \
               --directory artifacts \
               --platform "$platform" \
@@ -607,7 +621,8 @@ jobs:
             gh release create "$RELEASE_TAG" "${release_args[@]}" artifacts/*
           fi
 
-          if [[ "$is_unique_preview" == "true" ]]; then
+          # Publishing an explicit tag must not remove unrelated releases.
+          if [[ "$is_unique_preview" == "true" && "$GITHUB_REF_TYPE" != "tag" ]]; then
             older_tags="$(gh release list --limit 200 --json tagName --jq '.[].tagName' 2>/dev/null \
               | grep -E '^preview-[0-9]{8}-[0-9]{4}$' \
               | sort -r \
@@ -655,20 +670,9 @@ jobs:
             exit 0
           fi
 
-          # Check the complete matrix before changing the rolling release.
-          packages=()
-          for platform in Windows Linux Darwin; do
-            case "$platform" in
-              Windows) suffix=zip ;;
-              Linux) suffix=tar.gz ;;
-              Darwin) suffix=dmg ;;
-            esac
-            for arch in amd64 aarch64; do
-              package="artifacts/EasyCLIProxyAPI-v${APP_VERSION}-${platform}-${arch}.${suffix}"
-              test -s "$package"
-              packages+=("$package")
-            done
-          done
+          # The rolling Preview uses the same Windows x64-only build contract.
+          packages=("artifacts/EasyCLIProxyAPI-v${APP_VERSION}-Windows-amd64.zip")
+          test -s "${packages[0]}"
 
           notes="$RUNNER_TEMP/miaomiao-preview.md"
           cat > "$notes" <<EOF
@@ -678,7 +682,7 @@ jobs:
           Commit: https://github.com/${GH_REPO}/commit/${SOURCE_SHA}
           Build: https://github.com/${GH_REPO}/actions/runs/${GITHUB_RUN_ID}
 
-          Download the package for your system below. macOS packages are signed and notarized.
+          Download the Windows x64 package below.
           EOF
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then

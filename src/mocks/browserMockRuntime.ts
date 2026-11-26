@@ -7,7 +7,11 @@ import { createPluginMock, type PluginWebviewMockState } from './pluginMock';
 import { createQuotaMock, createQuotaMockFiles } from './quotaMock';
 import { normalizeAuthFileTags } from '../services/authFiles';
 import { hasDeepSeekArgumentConflict, parseAgentLaunchArguments } from '../services/agentLaunchArguments';
-import type { AcpStatus } from '../services/acp';
+import { DEFAULT_ACP_POOL_SETTINGS, type AcpAccountRuntime, type AcpPoolSettings, type AcpStatus } from '../services/acp';
+import type { UsageQuery } from '../services/usage';
+import { filterMockUsage, mockUsageAnalysis, mockUsageOverview, mockUsagePricing } from './usageMock';
+import { initialMockConfigYaml } from './configDocumentFixture';
+import type { ConfigDocument, KeyRemark } from '../services/configDocument';
 
 
 
@@ -107,13 +111,6 @@ function groupProviderRecords(section: ProviderSection, records: JsonObject[]): 
 }
 
 const isoHoursAgo = (hours: number) => new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
-const localHourKey = (date: Date) => [
-  date.getFullYear(),
-  String(date.getMonth() + 1).padStart(2, '0'),
-  String(date.getDate()).padStart(2, '0'),
-  String(date.getHours()).padStart(2, '0'),
-].join('-');
-
 export function resolveBrowserMockOptions(
   search: string,
   storedScenario?: string | null,
@@ -153,30 +150,6 @@ function createCoreStatus(scenario: BrowserMockScenario) {
   };
 }
 
-function createTimeline() {
-  return Array.from({ length: 24 }, (_, index) => {
-    const date = new Date(Date.now() - (23 - index) * 60 * 60 * 1000);
-    const requests = 6 + (index % 5) * 3;
-    const failure = index % 7 === 0 ? 1 : 0;
-    const canceled = index % 11 === 0 ? 1 : 0;
-    const success = Math.max(0, requests - failure - canceled);
-    const codexTokens = 18_000 + index * 1_350;
-    const claudeTokens = 9_000 + (index % 6) * 2_100;
-    return {
-      hour: localHourKey(date),
-      requests,
-      success,
-      failure,
-      canceled,
-      tokens: codexTokens + claudeTokens,
-      models: [
-        { key: 'gpt-5.2-codex', label: 'GPT-5.2 Codex', tokens: codexTokens, requests: Math.ceil(requests * 0.65) },
-        { key: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6', tokens: claudeTokens, requests: Math.floor(requests * 0.35) },
-      ],
-    };
-  });
-}
-
 function createUsageEvents() {
   const models = ['gpt-5.2-codex', 'claude-sonnet-4-6', 'gemini-3-pro'];
   const longError = 'Mock upstream rate limit exceeded: this preview account reached its per-minute request allowance while several parallel jobs were active. The proxy retried the request three times, but every attempt received HTTP 429. Retry after 45 seconds or reduce the number of concurrent requests. If this keeps happening, check the provider quota and the client retry policy. Diagnostic context: route=/v1/responses, attempt=3/3, window=60s, trace=preview_long_error_0123456789abcdefghijklmnopqrstuvwxyz_0123456789abcdefghijklmnopqrstuvwxyz.';
@@ -189,7 +162,7 @@ function createUsageEvents() {
     return {
       id: `mock-event-${index + 1}`,
       row_id: String(index + 1),
-      timestamp: isoHoursAgo(index / 2),
+      timestamp: isoHoursAgo(index < 5 ? (index + 1) / 120 : index / 2),
       latency_ms: 620 + index * 47,
       ttft_ms: failed ? null : 180 + index * 9,
       source: index % 2 === 0 ? 'codex' : 'claude-code',
@@ -198,13 +171,18 @@ function createUsageEvents() {
       canceled: index === 9,
       failure_status: failed ? 429 : 0,
       failure_body: index === 5 ? longError : failed ? 'Mock rate limit exceeded' : '',
-      provider: index % 2 === 0 ? 'openai-oauth' : 'claude-oauth',
+      provider: ['openai-oauth', 'claude-oauth', 'gemini-api'][index % 3],
+      auth_index: ['mock-codex-1', 'mock-claude-1', 'mock-gemini-runtime'][index % 3],
+      auth_type: index % 3 === 2 ? 'api-key' : 'oauth',
+      client_agent: ['codex', 'claude-code', 'gemini-cli'][index % 3],
+      request_id: `mock-request-${index + 1}`,
+      response_model: models[index % models.length],
       model: models[index % models.length],
       alias: '',
       reasoning_effort: index < 3 ? 'medium' : index % 2 === 0 ? 'high' : 'medium',
       service_tier: index === 0 ? 'priority' : index === 1 ? 'fast' : index === 2 ? 'default' : 'auto',
       response_service_tier: index === 0 ? 'priority' : index === 1 ? 'fast' : 'default',
-      endpoint: '/v1/responses',
+      endpoint: ['/v1/responses', '/v1/messages', '/v1/chat/completions'][index % 3],
       api_key_hash: 'mock-key-hash',
       api_key_display: 'sk-mock••••••••2026',
       api_key_remark: 'Browser Mock key',
@@ -214,7 +192,7 @@ function createUsageEvents() {
         reasoning_tokens: reasoning,
         cache_read_tokens: cacheRead,
         cache_creation_tokens: 0,
-        total_tokens: input + output + reasoning + cacheRead,
+        total_tokens: input + output,
       },
     };
   });
@@ -304,7 +282,6 @@ function createAgentStatuses() {
 }
 
 function createState(scenario: BrowserMockScenario) {
-  const timeline = createTimeline();
   const events = createUsageEvents();
   const authFiles: JsonObject[] = [
     {
@@ -416,26 +393,6 @@ function createState(scenario: BrowserMockScenario) {
       disabled: false,
     }],
   };
-  const analysis = {
-    models: [
-      { key: 'gpt-5.2-codex', label: 'GPT-5.2 Codex', requests: 182, failures: 4, tokens: 1_284_600 },
-      { key: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6', requests: 96, failures: 2, tokens: 684_200 },
-      { key: 'gemini-3-pro', label: 'Gemini 3 Pro', requests: 34, failures: 1, tokens: 218_500 },
-    ],
-    providers: [
-      { key: 'openai-oauth', label: 'OpenAI OAuth', requests: 182, failures: 4, tokens: 1_284_600 },
-      { key: 'claude-oauth', label: 'Claude OAuth', requests: 96, failures: 2, tokens: 684_200 },
-      { key: 'gemini-api', label: 'Gemini API', requests: 34, failures: 1, tokens: 218_500 },
-    ],
-    sources: [
-      { key: 'codex', label: 'Codex', requests: 164, failures: 4, tokens: 1_102_000 },
-      { key: 'claude-code', label: 'Claude Code', requests: 114, failures: 2, tokens: 752_000 },
-      { key: 'other', label: 'Other', requests: 34, failures: 1, tokens: 333_300 },
-    ],
-    apiKeys: [
-      { key: 'mock-key-hash', label: 'Browser Mock key', requests: 312, failures: 7, tokens: 2_187_300 },
-    ],
-  };
   return {
     scenario,
     coreStatus: createCoreStatus(scenario),
@@ -508,14 +465,23 @@ function createState(scenario: BrowserMockScenario) {
     appUpdateInfo: {
       currentVersion: '0.2.97',
       latestVersion: '0.3.0',
+      latestSeriesVersion: '0.3.0',
+      installedSeries: 'stable',
+      comparisonNewer: true,
       updateAvailable: true,
       releaseUrl: 'https://github.com/router-for-me/EasyCLIProxyAPI/releases/latest',
       releaseNotes: {
         'zh-CN': '## Browser Mock 更新示例\n\n- 新增界面调试模式\n- 改进启动体验',
         en: '## Browser Mock release\n\n- Added UI mock mode',
       },
+      skippedReleaseNotes: [{ version: '0.2.98', releaseNotes: {
+        'zh-CN': '## 修复\n\n- 改进版本检查的稳定性',
+        en: '## Fixed\n\n- Improved update check reliability',
+      } }],
       publishedAt: isoHoursAgo(18),
+      installAvailable: true,
       currentBuildAt: null,
+      latestBuildAt: null,
       autoUpdateSupported: true,
       preserveCoreSupported: true,
       downloadUrl: 'https://github.com/router-for-me/EasyCLIProxyAPI/releases/download/v0.3.0/EasyCLIProxyAPI-v0.3.0-Windows-amd64.zip',
@@ -561,29 +527,6 @@ function createState(scenario: BrowserMockScenario) {
     quotaApiCall: createQuotaMock(),
     oauthExcludedModels: { codex: [], claude: ['claude-legacy-*'], gemini: [] } as Record<string, string[]>,
     oauthSessions: new Map<string, string>(),
-    analysis,
-    usageOverview: {
-      totalRequests: 312,
-      successCount: 301,
-      failureCount: 7,
-      canceledCount: 4,
-      successRate: 96.47,
-      inputTokens: 1_264_000,
-      outputTokens: 486_500,
-      reasoningTokens: 286_800,
-      cacheReadTokens: 132_000,
-      cacheCreationTokens: 18_000,
-      totalTokens: 2_187_300,
-      rpm: 4.8,
-      tpm: 31_450,
-      tps: 58.4,
-      tpsSampleCount: 284,
-      averageLatencyMs: 1_284,
-      cacheHitRate: 0.386,
-      estimatedCost: 3.8421,
-      pricedRequests: 296,
-      timeline,
-    },
     usageEvents: events,
     usagePrices: [
       {
@@ -597,7 +540,7 @@ function createState(scenario: BrowserMockScenario) {
         source: 'mock', sourceModelId: 'claude-sonnet-4-6', updatedAtMs: Date.now(),
       },
     ],
-    usageStorage: { maxDatabaseSizeMb: 512, databaseSizeBytes: 84 * 1024 * 1024, totalRecords: 312, deletedRecords: 0 },
+    usageStorage: { maxDatabaseSizeMb: 512, databaseSizeBytes: 84 * 1024 * 1024, totalRecords: events.length, deletedRecords: 0 },
     agentStatuses: createAgentStatuses(),
     deepSeekStatus: {
       running: false,
@@ -913,6 +856,50 @@ function managementResponse(state: BrowserMockState, payload: JsonObject) {
   if (method === 'POST' && path === '/models/refresh') {
     return { ok: true, status: 'ok', changed_providers: [], catalog: [], codex_catalog: [], devin_catalog: [], sources: [], catalogs: [] };
   }
+  if (method === 'GET' && path === '/config/routing') {
+    const routing = asObject(state.extendedConfig.routing);
+    const cooldown = asObject(routing.cooldown);
+    return {
+      strategy: state.coreConfig.routingStrategy,
+      'session-affinity': state.coreConfig.routingSessionAffinity,
+      'session-affinity-ttl': state.coreConfig.routingSessionAffinityTtl,
+      retry: {
+        'request-retry': state.coreConfig.requestRetry,
+        'max-retry-credentials': state.coreConfig.maxRetryCredentials,
+        'max-retry-interval': state.coreConfig.maxRetryInterval,
+      },
+      cooldown: {
+        'disable-cooling': state.coreConfig.disableCooling,
+        'transient-error-cooldown-seconds': typeof cooldown['transient-error-cooldown-seconds'] === 'number'
+          ? cooldown['transient-error-cooldown-seconds']
+          : -1,
+      },
+    };
+  }
+  if (method === 'PUT' && path.startsWith('/config/routing/')) {
+    const subPath = path.slice('/config/routing/'.length);
+    const routingMap: Record<string, string> = {
+      strategy: 'routingStrategy',
+      'session-affinity': 'routingSessionAffinity',
+      'session-affinity-ttl': 'routingSessionAffinityTtl',
+      'retry/request-retry': 'requestRetry',
+      'retry/max-retry-credentials': 'maxRetryCredentials',
+      'retry/max-retry-interval': 'maxRetryInterval',
+      'cooldown/disable-cooling': 'disableCooling',
+    };
+    if (routingMap[subPath]) {
+      updateCoreConfig(state, { settings: { [routingMap[subPath]]: body } });
+    } else {
+      state.extendedConfig = applyTemplateChanges(state.extendedConfig, [{
+        path: ['routing', ...subPath.split('/')],
+        value: body,
+        remove: false,
+        expected: null,
+        expectedExists: false,
+      }]);
+    }
+    return { status: 'ok', 'config-version': 8 };
+  }
   if (method === 'GET' && path.startsWith('/routing/model-definitions/')) return mockModelDefinitions();
   if (method === 'GET' && path === '/config/oauth/excluded-models') {
     return clone(state.oauthExcludedModels);
@@ -971,6 +958,8 @@ function updateCoreConfig(state: BrowserMockState, payload: JsonObject) {
   state.extendedConfig = applyTemplateChanges(state.extendedConfig, changes);
   state.guiSettings.host = state.coreConfig.host;
   state.guiSettings.port = state.coreConfig.port;
+  const normalizedHost = state.coreConfig.host.trim().replace(/^\[|\]$/g, '').toLowerCase();
+  state.coreConfig.allowLan = Boolean(normalizedHost) && !['127.0.0.1', 'localhost', '::1'].includes(normalizedHost);
   return clone(state.coreConfig);
 }
 
@@ -990,6 +979,8 @@ const ERROR_SCENARIO_COMMANDS = new Set([
   'get_core_config_settings',
   'get_extended_core_config',
   'check_app_update',
+  'check_app_version_display',
+  'get_app_version_baselines',
   'check_latest_core',
   'management_request',
   'get_usage_overview',
@@ -1254,30 +1245,91 @@ export function createBrowserMockRuntime(
   pluginPages = 0,
   onPluginWebview?: (state: PluginWebviewMockState) => void,
 ): BrowserMockRuntime {
+  const claudePromptEditors = new Map<string, { overridesEnabled?: boolean | null }>();
   const state = createState(scenario);
   const acp: AcpStatus = {
     executable: 'C:/Users/demo/AppData/Local/agy/bin/agy.exe', profile: 'C:/ECPA/acp/antigravity',
     authenticated: false, busy: false, operation: '', models: [], selectedModel: '', error: null, latestProbe: null, upstreamEnabled: false, upstreamUrl: null,
-    accounts: [{ id: 'default', label: 'Default', email: null as string | null }], activeAccount: 'default',
+    accounts: [{ id: 'default', label: 'Default', email: null as string | null, saved: false }], activeAccount: 'default',
+    poolSettings: clone(DEFAULT_ACP_POOL_SETTINGS),
+    activeRequests: 0,
+    liveSessions: 0,
+    accountRuntime: {},
   };
   const acpAccountModels = new Map<string, string>();
   let acpCancelled = false;
-  const applyMockUpdateChannel = (channel: string) => {
+  let acpSequence = 0;
+  const mockAcpModels = [{ id: 'gemini-4-argon-medium', name: 'Gemini 4 Argon (Medium)' }, { id: 'gemini-3.8-flash-low', name: 'Gemini 3.8 Flash (Low)' }];
+  const validateAcpLabel = (value: unknown) => {
+    const raw = readString(value); const label = raw.trim();
+    if (!label || [...label].length > 80 || /[\u0000-\u001f\u007f-\u009f]/u.test(raw)) throw new Error('Enter an ACP account label of 1–80 characters without control characters');
+    return label;
+  };
+  const ensureMockRuntime = (id: string): AcpAccountRuntime => {
+    acp.accountRuntime ??= {};
+    if (!acp.accountRuntime[id]) {
+      acp.accountRuntime[id] = { authState: 'unknown', modelCount: 0, activeRequests: 0, liveSessions: 0, operating: false, cooldowns: [] };
+    }
+    return acp.accountRuntime[id];
+  };
+  const markMockAccountReady = (id: string) => {
+    const rt = ensureMockRuntime(id);
+    rt.authState = 'ready';
+    rt.modelCount = mockAcpModels.length;
+    rt.lastVerifiedAt = Math.floor(Date.now() / 1000);
+    rt.lastError = null;
+    rt.cooldowns = [];
+  };
+  const validateMockProxy = (value: unknown): string | null => {
+    const raw = readString(value).trim();
+    if (!raw) return null;
+    if (raw.length > 512 || /[\u0000-\u001f\u007f\s]/u.test(raw)) {
+      throw new Error("Enter a valid proxy URL (http://, https://, socks5://, socks5h://) or 'direct'");
+    }
+    if (raw.toLowerCase() === 'direct') return 'direct';
+    const lower = raw.toLowerCase();
+    if (!['http://', 'https://', 'socks5://', 'socks5h://', 'socks4://'].some(prefix => lower.startsWith(prefix) && raw.length > prefix.length)) {
+      throw new Error("Enter a valid proxy URL (http://, https://, socks5://, socks5h://) or 'direct'");
+    }
+    return raw;
+  };
+  const clearMockAcp = () => Object.assign(acp, { authenticated: false, models: [], selectedModel: '', latestProbe: null });
+  const mockAcpOperation = async (operation: string, action: () => void) => {
+    if (acp.busy) throw new Error('An ACP operation is already running');
+    acp.busy = true; acp.operation = operation; acp.error = null; acpCancelled = false;
+    try {
+      await sleep(Math.max(delayMs, 250));
+      if (acpCancelled) throw new Error('ACP request cancelled');
+      action();
+    } catch (cause) { acp.error = cause instanceof Error ? cause.message : String(cause); throw cause; }
+    finally { acp.busy = false; acp.operation = ''; }
+    return clone(acp);
+  };
+  const appBaselines = { stable: state.appUpdateInfo.currentVersion, preview: '20261103-1137', installedSeries: 'stable' as const };
+  const applyMockUpdateChannel = (channel: string, update = state.appUpdateInfo) => {
     const normalized = channel.trim() || 'stable';
-    state.appUpdateInfo.updateChannel = normalized;
+    update.updateChannel = normalized;
     if (normalized.startsWith('preview')) {
       const tag = normalized === 'preview' ? 'preview-20261104-1623' : normalized;
-      state.appUpdateInfo.latestVersion = '0.3.0-preview.202611041623';
-      state.appUpdateInfo.currentBuildAt = isoHoursAgo(42);
-      state.appUpdateInfo.releaseUrl = `https://github.com/router-for-me/EasyCLIProxyAPI/releases/tag/${tag}`;
-      state.appUpdateInfo.downloadFileName = 'EasyCLIProxyAPI-v0.3.0-preview.202611041623-Windows-amd64.zip';
-      state.appUpdateInfo.downloadUrl = `https://github.com/router-for-me/EasyCLIProxyAPI/releases/download/${tag}/${state.appUpdateInfo.downloadFileName}`;
+      update.currentVersion = appBaselines.preview;
+      update.latestVersion = '0.3.0-preview.20261104-1623';
+      update.latestSeriesVersion = '20261104-1623';
+      update.updateAvailable = false;
+      update.currentBuildAt = '2026-11-03T11:37:00Z';
+      update.latestBuildAt = '2026-11-04T16:23:00Z';
+      update.releaseUrl = `https://github.com/router-for-me/EasyCLIProxyAPI/releases/tag/${tag}`;
+      update.downloadFileName = 'EasyCLIProxyAPI-v0.3.0-preview.20261104-1623-Windows-amd64.zip';
+      update.downloadUrl = `https://github.com/router-for-me/EasyCLIProxyAPI/releases/download/${tag}/${update.downloadFileName}`;
     } else {
-      state.appUpdateInfo.latestVersion = '0.3.0';
-      state.appUpdateInfo.currentBuildAt = null;
-      state.appUpdateInfo.releaseUrl = 'https://github.com/router-for-me/EasyCLIProxyAPI/releases/latest';
-      state.appUpdateInfo.downloadFileName = 'EasyCLIProxyAPI-v0.3.0-Windows-amd64.zip';
-      state.appUpdateInfo.downloadUrl = `https://github.com/router-for-me/EasyCLIProxyAPI/releases/download/v0.3.0/${state.appUpdateInfo.downloadFileName}`;
+      update.currentVersion = appBaselines.stable;
+      update.latestVersion = '0.3.0';
+      update.latestSeriesVersion = '0.3.0';
+      update.updateAvailable = true;
+      update.currentBuildAt = null;
+      update.latestBuildAt = null;
+      update.releaseUrl = 'https://github.com/router-for-me/EasyCLIProxyAPI/releases/latest';
+      update.downloadFileName = 'EasyCLIProxyAPI-v0.3.0-Windows-amd64.zip';
+      update.downloadUrl = `https://github.com/router-for-me/EasyCLIProxyAPI/releases/download/v0.3.0/${update.downloadFileName}`;
     }
   };
   if (typeof window !== 'undefined') {
@@ -1297,16 +1349,86 @@ export function createBrowserMockRuntime(
   if (scenario === 'empty') {
     state.usageEvents = [];
     state.usagePrices = [];
-    Object.assign(state.usageOverview, Object.fromEntries(Object.entries(state.usageOverview)
-      .filter(([, value]) => typeof value === 'number').map(([key]) => [key, 0])));
-    state.usageOverview.timeline = [];
-    state.analysis = { models: [], providers: [], sources: [], apiKeys: [] };
     state.usageStorage.databaseSizeBytes = 0;
     state.usageStorage.totalRecords = 0;
     state.coreConfig.apiKeys = [];
   }
   const pluginMock = createPluginMock(state, pluginPages, onPluginWebview);
   const emit = (event: string, payload: unknown) => emitEvent(event, clone(payload));
+  let configVersion = 1;
+  const configDocument: ConfigDocument = { yaml: initialMockConfigYaml, etag: `"${'1'.padStart(64, '0')}"`, remarks: [], remarksUnavailable: false };
+  let reverseProxyConfig = {
+    enabled: false,
+    listenHost: '0.0.0.0',
+    listenPort: 443,
+    targetPort: state.coreConfig.port,
+    certPath: '',
+    keyPath: '',
+  };
+  let reverseProxyRunning = false;
+  const reverseProxyState = () => ({
+    running: reverseProxyRunning,
+    listening: reverseProxyRunning ? `${reverseProxyConfig.listenHost}:${reverseProxyConfig.listenPort}` : null,
+    target: reverseProxyRunning ? `127.0.0.1:${reverseProxyConfig.targetPort || state.coreConfig.port}` : null,
+    requestsTotal: reverseProxyRunning ? 18 : 0,
+    error: null,
+    hardening: {
+      loopbackBind: state.coreConfig.host === '127.0.0.1',
+      trustedProxies: reverseProxyRunning,
+      restartRequired: false,
+    },
+    config: clone(reverseProxyConfig),
+  });
+  let mcpServers: Array<{
+    id: string;
+    name: string;
+    transport: string;
+    command: string | null;
+    args: string[];
+    env: Record<string, string>;
+    url: string | null;
+    headers: Record<string, string>;
+    enabled: boolean;
+    description: string | null;
+  }> = scenario === 'empty' ? [] : [
+    {
+      id: 'mcp-filesystem',
+      name: 'filesystem',
+      transport: 'stdio',
+      command: 'npx',
+      args: ['-y', '@modelcontextprotocol/server-filesystem', './workspace'],
+      env: {},
+      url: null,
+      headers: {},
+      enabled: true,
+      description: 'Browser Mock local workspace file access server',
+    },
+    {
+      id: 'mcp-docs-http',
+      name: 'docs-search',
+      transport: 'http',
+      command: null,
+      args: [],
+      env: {},
+      url: 'http://127.0.0.1:8788/mcp',
+      headers: {},
+      enabled: false,
+      description: 'Browser Mock HTTP documentation search endpoint',
+    },
+  ];
+  const mockSkills = scenario === 'empty' ? [] : [
+    {
+      id: 'skill-code-review',
+      name: 'code-review',
+      description: 'Structured pull request and diff review checklist for coding agents.',
+      path: 'C:\\Users\\Mock\\.agents\\skills\\code-review\\SKILL.md',
+      root: 'C:\\Users\\Mock\\.agents\\skills',
+      source: 'project',
+      enabled: true,
+      fileCount: 2,
+      body: '---\nname: code-review\ndescription: Structured pull request and diff review checklist for coding agents.\n---\n\n# Code Review Skill\n\n- Check correctness, edge cases, and security boundaries.\n- Verify tests cover new behavior.\n',
+    },
+  ];
 
   const invoke = async (command: string, rawPayload?: unknown): Promise<unknown> => {
     await sleep(delayMs);
@@ -1325,8 +1447,14 @@ export function createBrowserMockRuntime(
       case 'plugin:app|identifier': return 'com.cpa.gui.browser-mock';
       case 'plugin:dialog|open': {
         const options = asObject(payload.options);
-        return options.directory
-          ? 'C:\\Users\\Mock\\Projects\\demo'
+        if (options.directory) return 'C:\\Users\\Mock\\Projects\\demo';
+        const filters = Array.isArray(options.filters) ? options.filters : [];
+        const isZip = filters.some((filter) => {
+          const extensions = asObject(filter).extensions;
+          return Array.isArray(extensions) && extensions.includes('zip');
+        });
+        return isZip
+          ? 'C:\\Users\\Mock\\Downloads\\mock-theme.zip'
           : 'C:\\Users\\Mock\\Certificates\\mock.pem';
       }
       case 'plugin:dialog|save': return 'C:\\Users\\Mock\\Downloads\\mock-output.json';
@@ -1334,6 +1462,12 @@ export function createBrowserMockRuntime(
       case 'detect_core_platform': return { os: 'windows', arch: 'x86_64', assetOs: 'windows', assetArch: 'amd64', archiveKind: 'zip' };
       case 'get_linux_system_theme': return 'light';
       case 'detect_window_material': return null;
+      case 'import_custom_theme': {
+        const importPath = String(payload.path ?? '').trim();
+        if (!importPath) throw new Error('not-found');
+        if (!payload.overwrite) return { importedIds: [], existingIds: ['harbor-dark'] };
+        return { importedIds: ['harbor-dark'], existingIds: [] };
+      }
       case 'list_custom_themes': return { files: [
         { folder: 'harbor-dark', content: JSON.stringify(MOCK_CUSTOM_THEME) },
         { folder: 'harbor-image-dark', content: JSON.stringify({
@@ -1366,6 +1500,29 @@ export function createBrowserMockRuntime(
         return null;
       }
 
+      case 'get_cpa_connection': return { remoteActive: false, remoteSelected: false, endpoint: null, needsRepair: false, revision: 0 };
+      case 'read_cpa_config_document':
+      case 'save_cpa_config_document': {
+        if (payload.revision !== 0) throw 'targetChanged';
+        if (scenario === 'error') throw 'unavailable';
+        if (!state.coreStatus.ready) throw 'startCore';
+        if (command === 'read_cpa_config_document') return clone(configDocument);
+        if (payload.etag !== configDocument.etag) throw 'conflict';
+        if (typeof payload.yaml !== 'string') throw 'rejected';
+        if (payload.yaml !== configDocument.yaml) {
+          configDocument.yaml = payload.yaml;
+          configDocument.etag = `"${(++configVersion).toString(16).padStart(64, '0')}"`;
+        }
+        for (const { key, remark } of (payload.remarks ?? []) as KeyRemark[]) {
+          configDocument.remarks = configDocument.remarks.filter(entry => entry.key !== key);
+          if (remark) configDocument.remarks.push({ key, remark });
+        }
+        return { document: clone(configDocument), restartRequired: false, syncFailed: false, remarksFailed: false, readbackChanged: false };
+      }
+      case 'test_remote_cpa':
+      case 'select_cpa_connection':
+      case 'get_remote_cpa_keys':
+      case 'save_remote_cpa_keys': throw 'notActive';
       case 'get_core_status': return clone(state.coreStatus);
       case 'main_window_active': return !document.hidden;
       case 'start_core_process': {
@@ -1502,7 +1659,11 @@ export function createBrowserMockRuntime(
         return config;
       }
       case 'set_core_proxy_url': {
-        return updateCoreConfig(state, { settings: { proxyUrl: readString(payload.proxyUrl) } });
+        const proxyUrl = readString(payload.proxyUrl).trim();
+        const proxyOverride = typeof payload.proxyOverride === 'boolean' ? payload.proxyOverride : Boolean(proxyUrl);
+        const config = updateCoreConfig(state, { settings: { proxyUrl: proxyOverride ? proxyUrl : '', proxyOverride } });
+        emit('config-files-changed', { paths: ['cpa-core/config.yaml'], errors: [] });
+        return config;
       }
       case 'set_core_session_affinity': {
         return updateCoreConfig(state, { settings: { routingSessionAffinity: Boolean(payload.enabled) } });
@@ -1548,7 +1709,20 @@ export function createBrowserMockRuntime(
         state.autoUpdate.phase = 'waiting-update';
         return clone(state.autoUpdate);
       }
-      case 'check_app_update': return clone(state.appUpdateInfo);
+      case 'get_app_version_baselines': return clone(appBaselines);
+      case 'check_app_version_display': {
+        if (payload.series !== 'stable' && payload.series !== 'preview') throw new Error('Unsupported application version display series');
+        const display = clone(state.appUpdateInfo);
+        applyMockUpdateChannel(payload.series, display);
+        if (payload.series === 'preview') display.skippedReleaseNotes = [];
+        return display;
+      }
+      case 'check_app_update': return clone({
+        ...state.appUpdateInfo,
+        skippedReleaseNotes: state.appUpdateInfo.updateChannel === 'stable' && state.appUpdateInfo.updateAvailable
+          ? state.appUpdateInfo.skippedReleaseNotes
+          : [],
+      });
       case 'refresh_managed_codex_model_catalog': return false;
       case 'get_app_update_task': return clone(state.appUpdateTask);
       case 'get_update_channel': return state.appUpdateInfo.updateChannel ?? 'stable';
@@ -1565,7 +1739,7 @@ export function createBrowserMockRuntime(
           cancellable: true,
           phase: 'downloading',
           preserveCore: payload.preserveCore === true,
-          targetVersion: state.appUpdateInfo.latestVersion,
+          targetVersion: typeof payload.expectedVersion === 'string' ? payload.expectedVersion : state.appUpdateInfo.latestVersion,
           downloadedBytes: 18 * 1024 * 1024,
           totalBytes: state.appUpdateInfo.downloadSizeBytes,
           percent: 38,
@@ -1670,35 +1844,148 @@ export function createBrowserMockRuntime(
         return clone(acp);
       }
       case 'add_acp_account': {
-        if (acp.busy) throw new Error('An ACP operation is already running');
-        const id = 'mock-account-' + acp.accounts.length;
-        acpAccountModels.set(acp.activeAccount, acp.selectedModel);
-        acp.accounts.push({ id, label: readString(payload.label).trim(), email: 'work.acp@example.test' });
-        acp.activeAccount = id; acp.selectedModel = '';
-        acp.latestProbe = null;
-        acp.authenticated = true;
-        acp.selectedModel = acp.models[0]?.id || 'gemini-4-argon-medium';
+        const label = validateAcpLabel(payload.label);
+        if (!acp.executable) throw new Error('Install official Antigravity CLI before adding an account');
+        if (acp.accounts.filter(a => a.saved).length >= 64) throw new Error('Up to 64 ACP accounts can be saved');
+        return mockAcpOperation('login', () => {
+          const id = (++acpSequence).toString(16).padStart(32, '0');
+          acpAccountModels.set(acp.activeAccount, acp.selectedModel);
+          acp.accounts = acp.accounts.filter(a => a.id !== 'default' || a.saved);
+          acp.accounts.push({ id, label, email: 'work.acp@example.test', saved: true });
+          acp.activeAccount = id;
+          markMockAccountReady(id);
+          Object.assign(acp, { authenticated: true, models: clone(mockAcpModels), selectedModel: mockAcpModels[0].id, latestProbe: null });
+        });
+      }
+      case 'rename_acp_account': {
+        const label = validateAcpLabel(payload.label);
+        return mockAcpOperation('rename', () => {
+          const account = acp.accounts.find(a => a.id === payload.accountId);
+          if (!account) throw new Error('Unknown ACP account');
+          account.label = label;
+        });
+      }
+      case 'update_acp_account_settings': {
+        const id = readString(payload.accountId);
+        const patch = asObject(payload.patch);
+        const account = acp.accounts.find(a => a.id === id);
+        if (!account) throw new Error('Unknown ACP account');
+        if (patch.label !== undefined) account.label = validateAcpLabel(patch.label);
+        if (patch.enabled !== undefined) account.enabled = Boolean(patch.enabled);
+        if (patch.priority !== undefined) {
+          const priority = Math.max(0, Math.floor(readNumber(patch.priority, 0)));
+          account.priority = priority;
+        }
+        if (patch.weight !== undefined) {
+          const weight = Math.floor(readNumber(patch.weight, 1));
+          if (weight < 1 || weight > 100) throw new Error('ACP account weight must be between 1 and 100');
+          account.weight = weight;
+        }
+        if (patch.maxConcurrency !== undefined) {
+          const limit = Math.floor(readNumber(patch.maxConcurrency, 1));
+          if (limit < 1 || limit > 16) throw new Error('ACP account max concurrency must be between 1 and 16');
+          account.maxConcurrency = limit;
+        }
+        if (patch.proxyUrl !== undefined) {
+          account.proxyUrl = validateMockProxy(patch.proxyUrl);
+        }
         return clone(acp);
       }
+      case 'update_acp_pool_settings': {
+        const next = asObject(payload.settings) as Partial<AcpPoolSettings>;
+        const merged: AcpPoolSettings = { ...(acp.poolSettings || DEFAULT_ACP_POOL_SETTINGS), ...next };
+        if (merged.maxGlobalConcurrency < 1 || merged.maxGlobalConcurrency > 128) throw new Error('ACP global max concurrency must be between 1 and 128');
+        if (merged.maxLiveSessions < 4 || merged.maxLiveSessions > 256) throw new Error('ACP max live sessions must be between 4 and 256');
+        if (merged.queueWaitMs < 0 || merged.queueWaitMs > 60000) throw new Error('ACP queue wait timeout must be between 0 and 60000 ms');
+        if (merged.maxFailoverAttempts < 0 || merged.maxFailoverAttempts > 8) throw new Error('ACP failover attempts must be between 0 and 8');
+        if (merged.cooldownBaseSecs < 5 || merged.cooldownBaseSecs > 3600) throw new Error('ACP cooldown base must be between 5 and 3600 seconds');
+        if (merged.cooldownMaxSecs < merged.cooldownBaseSecs || merged.cooldownMaxSecs > 86400) throw new Error('ACP cooldown max must be between 10 and 86400 seconds');
+        acp.poolSettings = merged;
+        return clone(acp);
+      }
+      case 'verify_acp_account': {
+        const id = readString(payload.accountId);
+        const account = acp.accounts.find(a => a.id === id);
+        if (!account) throw new Error('Unknown ACP account');
+        if (!acp.executable) throw new Error('Install official Antigravity CLI before connecting');
+        return mockAcpOperation('refresh', () => {
+          account.saved = true;
+          markMockAccountReady(id);
+          if (acp.activeAccount === id) {
+            Object.assign(acp, { authenticated: true, models: clone(mockAcpModels), selectedModel: acp.selectedModel || mockAcpModels[0].id });
+          }
+        });
+      }
+      case 'verify_all_acp_accounts': {
+        if (!acp.executable) throw new Error('Install official Antigravity CLI before connecting');
+        return mockAcpOperation('verify_all', () => {
+          for (const account of acp.accounts) {
+            if (account.enabled !== false && (account.saved || account.id === acp.activeAccount)) {
+              markMockAccountReady(account.id);
+              if (account.id === acp.activeAccount) {
+                Object.assign(acp, { authenticated: true, models: clone(mockAcpModels), selectedModel: acp.selectedModel || mockAcpModels[0].id });
+              }
+            }
+          }
+        });
+      }
+      case 'reset_acp_account_cooldown': {
+        const id = payload.accountId ? readString(payload.accountId) : null;
+        acp.accountRuntime ??= {};
+        for (const [key, rt] of Object.entries(acp.accountRuntime)) {
+          if (!id || key === id) {
+            rt.cooldowns = [];
+            if (rt.authState === 'auth_required' || rt.authState === 'error') rt.authState = 'unknown';
+            rt.lastError = null;
+          }
+        }
+        return clone(acp);
+      }
+      case 'remove_acp_account': return mockAcpOperation('remove', () => {
+        const id = readString(payload.accountId);
+        if (!acp.accounts.some(a => a.id === id)) throw new Error('Unknown ACP account');
+        acp.accounts = acp.accounts.filter(a => a.id !== id);
+        acpAccountModels.delete(id);
+        if (acp.accountRuntime) delete acp.accountRuntime[id];
+        if (!acp.accounts.length) acp.accounts = [{ id: 'default', label: 'Default', email: null, saved: false }];
+        if (acp.activeAccount === id) { acp.activeAccount = acp.accounts[0].id; clearMockAcp(); }
+      });
+      case 'logout_acp_account': return mockAcpOperation('logout', () => {
+        const id = payload.accountId ? readString(payload.accountId) : acp.activeAccount;
+        const account = acp.accounts.find(a => a.id === id);
+        if (!account) throw new Error('Unknown ACP account');
+        if (acp.accountRuntime) delete acp.accountRuntime[id];
+        if (id === acp.activeAccount) clearMockAcp();
+        account.email = null;
+      });
       case 'switch_acp_account': {
-        if (acp.busy) throw new Error('An ACP operation is already running');
         const id = readString(payload.accountId);
         if (!acp.accounts.some(account => account.id === id)) throw new Error('Unknown ACP account');
-        acpAccountModels.set(acp.activeAccount, acp.selectedModel);
-        acp.activeAccount = id; acp.selectedModel = acpAccountModels.get(id) || acp.models[0]?.id || '';
-        acp.latestProbe = null;
-        return clone(acp);
+        return mockAcpOperation('refresh', () => {
+          acpAccountModels.set(acp.activeAccount, acp.selectedModel);
+          acp.activeAccount = id;
+          markMockAccountReady(id);
+          Object.assign(acp, { authenticated: true, models: clone(mockAcpModels), selectedModel: acpAccountModels.get(id) || mockAcpModels[0].id, latestProbe: null });
+        });
       }
-      case 'relogin_acp_account':
-      case 'acp_connect': {
-        if (acp.busy) throw new Error('An ACP operation is already running');
+      case 'relogin_acp_account': return mockAcpOperation('login', () => {
+        const id = payload.accountId ? readString(payload.accountId) : acp.activeAccount;
+        const account = acp.accounts.find(a => a.id === id);
+        if (!account) throw new Error('Unknown ACP account');
+        account.saved = true;
+        account.email = account.id === 'default' ? 'personal.acp@example.test' : 'work.acp@example.test';
+        markMockAccountReady(account.id);
+        if (id === acp.activeAccount) {
+          Object.assign(acp, { authenticated: true, error: null, latestProbe: null, models: clone(mockAcpModels) });
+          if (!acp.models.some(model => model.id === acp.selectedModel)) acp.selectedModel = acp.models[0].id;
+        }
+      });
+      case 'acp_connect': return mockAcpOperation('login', () => {
         const account = acp.accounts.find(account => account.id === acp.activeAccount);
-        if (account) account.email = account.id === 'default' ? 'personal.acp@example.test' : 'work.acp@example.test';
-        Object.assign(acp, { authenticated: true, error: null, latestProbe: null,
-          models: [{ id: 'gemini-4-argon-medium', name: 'Gemini 4 Argon (Medium)' }, { id: 'gemini-3.8-flash-low', name: 'Gemini 3.8 Flash (Low)' }] });
+        if (account) { account.saved = true; account.email = account.id === 'default' ? 'personal.acp@example.test' : 'work.acp@example.test'; markMockAccountReady(account.id); }
+        Object.assign(acp, { authenticated: true, error: null, latestProbe: null, models: clone(mockAcpModels) });
         if (!acp.models.some(model => model.id === acp.selectedModel)) acp.selectedModel = acp.models[0].id;
-        return clone(acp);
-      }
+      });
       case 'select_acp_model': {
         if (acp.busy) throw new Error('Wait for the current ACP operation to finish');
         if (!acp.models.some(model => model.id === payload.model)) throw new Error('Refresh available ACP models first');
@@ -1708,12 +1995,14 @@ export function createBrowserMockRuntime(
       }
       case 'test_acp_connection': {
         if (acp.busy) throw new Error('An ACP operation is already running');
-        if (!acp.authenticated || !acp.selectedModel) throw new Error('Refresh available ACP models first');
+        const targetId = payload.accountId ? readString(payload.accountId) : acp.activeAccount;
+        const targetModel = payload.model ? readString(payload.model) : acp.selectedModel;
+        if (!acp.authenticated || !targetModel) throw new Error('Refresh available ACP models first');
         acp.busy = true; acp.operation = 'test'; acp.error = null; acp.latestProbe = null; acpCancelled = false;
         try {
           await sleep(Math.max(delayMs, 250));
           if (acpCancelled) throw new Error('ACP request cancelled');
-          acp.latestProbe = { text: 'ACP_OK', model: acp.selectedModel, durationMs: 9214, firstTextMs: 8780, stopReason: 'end_turn' };
+          acp.latestProbe = { text: 'ACP_OK', model: targetModel, durationMs: 9214, firstTextMs: 8780, stopReason: 'end_turn', accountId: targetId };
           return clone(acp.latestProbe);
         } catch (cause) {
           acp.error = cause instanceof Error ? cause.message : String(cause);
@@ -1750,25 +2039,19 @@ export function createBrowserMockRuntime(
         state: state.coreStatus.ready ? 'collecting' : 'waiting-core',
         message: state.coreStatus.ready ? 'Browser Mock is collecting usage records' : 'Waiting for the core to start',
         lastCollectedAt: new Date().toISOString(),
-        totalRecords: state.usageOverview.totalRequests,
+        totalRecords: state.usageEvents.length,
       };
-      case 'get_usage_overview': return clone(state.usageOverview);
-      case 'get_usage_analysis': return clone(state.analysis);
+      case 'get_usage_overview': return mockUsageOverview(filterMockUsage(state.usageEvents, asObject(payload.query) as UsageQuery), state.usagePrices, asObject(payload.query).speed_mode);
+      case 'get_usage_analysis': {
+        const analysis = mockUsageAnalysis(filterMockUsage(state.usageEvents, asObject(payload.query) as UsageQuery));
+        if (scenario === 'empty') delete analysis.upstreams;
+        return analysis;
+      }
       case 'get_usage_events': {
         const query = asObject(payload.query);
         const page = Math.max(1, readNumber(query.page, 1));
         const pageSize = Math.max(1, readNumber(query.page_size, 50));
-        const events = state.usageEvents.filter(event => {
-          for (const key of ['model', 'provider', 'source', 'api_key_hash'] as const) {
-            if (query[key] && event[key] !== query[key]) return false;
-          }
-          for (const key of ['failed', 'canceled'] as const) {
-            if (typeof query[key] === 'boolean' && event[key] !== query[key]) return false;
-          }
-          const timestamp = Date.parse(event.timestamp);
-          return (!query.start || timestamp >= Date.parse(String(query.start)))
-            && (!query.end || timestamp <= Date.parse(String(query.end)));
-        });
+        const events = filterMockUsage(state.usageEvents, query as UsageQuery);
         const start = (page - 1) * pageSize;
         return {
           items: clone(events.slice(start, start + pageSize)),
@@ -1779,18 +2062,7 @@ export function createBrowserMockRuntime(
         };
       }
       case 'get_usage_pricing': {
-        const rows = state.usagePrices.map((price, index) => ({
-          model: price.model,
-          requests: index === 0 ? 182 : 96,
-          inputTokens: index === 0 ? 820_000 : 386_000,
-          outputTokens: index === 0 ? 312_000 : 142_000,
-          cacheReadTokens: index === 0 ? 82_000 : 44_000,
-          cacheCreationTokens: index === 0 ? 0 : 18_000,
-          totalTokens: index === 0 ? 1_214_000 : 590_000,
-          estimatedCost: index === 0 ? 1.92 : 1.71,
-          price: clone(price),
-        }));
-        return { rows, totalCost: rows.length ? 3.63 : 0, totalRequests: rows.length ? 278 : 0, pricedRequests: rows.length ? 278 : 0, savedPrices: state.usagePrices.length };
+        return clone(mockUsagePricing(filterMockUsage(state.usageEvents, asObject(payload.query) as UsageQuery), state.usagePrices));
       }
       case 'get_usage_storage_settings': return clone(state.usageStorage);
       case 'save_usage_storage_settings': {
@@ -1837,7 +2109,11 @@ export function createBrowserMockRuntime(
         matches: clone(state.usagePrices),
         unmatched: ['mock-unknown-model'],
       };
-      case 'apply_usage_model_prices': return { imported: asArray(payload.prices).length };
+      case 'apply_usage_model_prices': {
+        const prices = asArray(payload.prices);
+        for (const price of prices) await invoke('save_usage_model_price', { price });
+        return { imported: prices.length };
+      }
 
       case 'get_agent_environment_options': return { supported: false, defaultDirectory: '/home/user/.config', distributions: [] };
       case 'get_agent_config_statuses':
@@ -1946,6 +2222,64 @@ export function createBrowserMockRuntime(
         return clone(state.speedAliases);
       }
 
+      case 'get_agent_system_prompt_editor': {
+        const client = readString(payload.client) || 'zcode';
+        const saved = claudePromptEditors.get(client);
+        if (saved) return clone(saved);
+        const supportsSwitch = client === 'claude-code' || client === 'claude-desktop';
+        const defaultPrompt = `You are ${client}, a coding assistant.`;
+        return {
+          client,
+          defaultPrompt,
+          builtinDefaultPrompt: defaultPrompt,
+          defaultSource: 'template',
+          defaultCustomized: false,
+          ...(supportsSwitch && { overridesEnabled: null }),
+          defaultMode: 'replace',
+          defaultPreserveDynamicContext: true,
+          proxyActive: false,
+          proxyPort: null,
+          models: [
+            { id: 'gpt-5.2-codex', customized: false, prompt: defaultPrompt, defaultPrompt, mode: 'replace', preserveDynamicContext: true },
+            { id: 'claude-sonnet-4-6', customized: false, prompt: defaultPrompt, defaultPrompt, mode: 'replace', preserveDynamicContext: true },
+          ],
+        };
+      }
+      case 'save_agent_system_prompt_editor': {
+        const req = asObject(payload.request);
+        const client = readString(req.client) || 'zcode';
+        const builtinDefaultPrompt = `You are ${client}, a coding assistant.`;
+        const defaultCustomized = Boolean(req.defaultCustomized);
+        const defaultPrompt = defaultCustomized ? readString(req.defaultPrompt) : builtinDefaultPrompt;
+        const models = asArray(req.models).map(asObject).map((m) => ({
+          id: readString(m.id),
+          customized: Boolean(m.customized),
+          prompt: Boolean(m.customized) ? readString(m.prompt) : defaultPrompt,
+          defaultPrompt,
+          mode: readString(m.mode) || 'replace',
+          preserveDynamicContext: m.preserveDynamicContext !== false,
+        }));
+        const supportsSwitch = client === 'claude-code' || client === 'claude-desktop';
+        const overridesEnabled = typeof req.overridesEnabled === 'boolean'
+          ? req.overridesEnabled : claudePromptEditors.get(client)?.overridesEnabled ?? null;
+        const anyActive = (!supportsSwitch || overridesEnabled !== false)
+          && (defaultCustomized || models.some((m) => m.customized));
+        const editor = {
+          client,
+          defaultPrompt,
+          builtinDefaultPrompt,
+          defaultSource: 'template',
+          defaultCustomized,
+          ...(supportsSwitch && { overridesEnabled }),
+          defaultMode: readString(req.defaultMode) || 'replace',
+          defaultPreserveDynamicContext: req.defaultPreserveDynamicContext !== false,
+          proxyActive: anyActive,
+          proxyPort: anyActive ? 18331 : null,
+          models,
+        };
+        if (supportsSwitch) claudePromptEditors.set(client, editor);
+        return clone(editor);
+      }
       case 'get_codex_model_catalog_editor': return clone(state.codexCatalog);
       case 'get_codex_subagent_config': return clone(state.codexSubagents);
       case 'save_codex_subagent_config': {
@@ -2098,6 +2432,119 @@ export function createBrowserMockRuntime(
 
       case 'get_codex_cli_daemon_running': return true;
       case 'get_lan_ipv4': return ['192.168.100.100'];
+      case 'reverse_proxy_get_state': return reverseProxyState();
+      case 'reverse_proxy_apply':
+      case 'reverse_proxy_start': {
+        const next = asObject(payload.config);
+        reverseProxyConfig = {
+          enabled: command === 'reverse_proxy_start' ? true : Boolean(next.enabled),
+          listenHost: readString(next.listenHost) || '0.0.0.0',
+          listenPort: readNumber(next.listenPort, 443),
+          targetPort: readNumber(next.targetPort, state.coreConfig.port),
+          certPath: readString(next.certPath),
+          keyPath: readString(next.keyPath),
+        };
+        reverseProxyRunning = reverseProxyConfig.enabled;
+        if (reverseProxyRunning) {
+          updateCoreConfig(state, { settings: { host: '127.0.0.1' } });
+        }
+        return reverseProxyState();
+      }
+      case 'reverse_proxy_stop': {
+        reverseProxyConfig.enabled = false;
+        reverseProxyRunning = false;
+        return reverseProxyState();
+      }
+      case 'list_mcp_servers': return clone(mcpServers);
+      case 'save_mcp_server': {
+        const incoming = asObject(payload.server);
+        const name = readString(incoming.name).trim();
+        if (!name) throw new Error('Server name cannot be empty');
+        const id = readString(incoming.id).trim() || `mcp-${name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'server'}`;
+        const saved = {
+          id,
+          name,
+          transport: readString(incoming.transport) || 'stdio',
+          command: incoming.command == null ? null : readString(incoming.command),
+          args: asArray(incoming.args).map(String),
+          env: clone(asObject(incoming.env)) as Record<string, string>,
+          url: incoming.url == null ? null : readString(incoming.url),
+          headers: clone(asObject(incoming.headers)) as Record<string, string>,
+          enabled: incoming.enabled !== false,
+          description: incoming.description == null ? null : readString(incoming.description),
+        };
+        const existingIndex = mcpServers.findIndex(item => item.id === id);
+        if (existingIndex >= 0) mcpServers[existingIndex] = saved;
+        else mcpServers.push(saved);
+        return clone(saved);
+      }
+      case 'delete_mcp_server': {
+        mcpServers = mcpServers.filter(item => item.id !== readString(payload.id));
+        return null;
+      }
+      case 'set_mcp_server_enabled': {
+        const target = mcpServers.find(item => item.id === readString(payload.id));
+        if (target) target.enabled = Boolean(payload.enabled);
+        return null;
+      }
+      case 'sync_mcp_server_to_openclaw': return 'C:\\Users\\Mock\\.openclaw\\openclaw.json';
+      case 'open_mcp_skills_directory': return null;
+      case 'export_mcp_servers_json': {
+        const map = Object.fromEntries(mcpServers.map(server => [
+          server.name,
+          {
+            type: server.transport,
+            ...(server.command ? { command: server.command } : {}),
+            ...(server.args.length ? { args: server.args } : {}),
+            ...(Object.keys(server.env).length ? { env: server.env } : {}),
+            ...(server.url ? { url: server.url } : {}),
+            ...(Object.keys(server.headers).length ? { headers: server.headers } : {}),
+          },
+        ]));
+        return JSON.stringify({ mcpServers: map }, null, 2);
+      }
+      case 'import_mcp_servers_json': {
+        const parsed = asObject(JSON.parse(readString(payload.raw) || '{}'));
+        const map = asObject(parsed.mcpServers ?? parsed);
+        let added = 0;
+        let updated = 0;
+        for (const [name, rawEntry] of Object.entries(map)) {
+          const entry = asObject(rawEntry);
+          const existing = mcpServers.find(item => item.name.toLowerCase() === name.toLowerCase());
+          const transport = readString(entry.type || entry.transport) || (entry.url ? 'http' : 'stdio');
+          const next = {
+            id: existing?.id ?? `mcp-${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+            name,
+            transport,
+            command: entry.command ? readString(entry.command) : null,
+            args: asArray(entry.args).map(String),
+            env: clone(asObject(entry.env)) as Record<string, string>,
+            url: entry.url ? readString(entry.url) : null,
+            headers: clone(asObject(entry.headers)) as Record<string, string>,
+            enabled: entry.enabled !== false,
+            description: entry.description ? readString(entry.description) : null,
+          };
+          if (existing) {
+            Object.assign(existing, next);
+            updated += 1;
+          } else {
+            mcpServers.push(next);
+            added += 1;
+          }
+        }
+        return { added, updated, skipped: 0, errors: [] };
+      }
+      case 'list_skills': return mockSkills.map(({ body: _body, ...skill }) => clone(skill));
+      case 'get_skill_detail': {
+        const skill = mockSkills.find(item => item.path === readString(payload.path)) ?? mockSkills[0];
+        if (!skill) throw new Error('Skill not found');
+        return { entry: clone({ ...skill, body: undefined }), body: skill.body };
+      }
+      case 'set_skill_enabled': {
+        const skill = mockSkills.find(item => item.path === readString(payload.path));
+        if (skill) skill.enabled = Boolean(payload.enabled);
+        return null;
+      }
       default:
         if (command.startsWith('plugin:window|') || command.startsWith('plugin:webview|')) return null;
         console.warn(`[Browser Mock] Command not implemented: ${command}`, rawPayload);

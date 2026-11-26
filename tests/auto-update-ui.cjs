@@ -35,11 +35,14 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
     await page.addStyleTag({ content: '#browser-mock-toolbar { display: none; }' });
     await page.evaluate(() => {
       const invoke = window.__TAURI_INTERNALS__.invoke;
-      window.autoUpdateTest = { calls: [], override: null };
+      window.autoUpdateTest = { calls: [], override: null, appUnsupported: false };
       window.__TAURI_INTERNALS__.invoke = async (command, args, options) => {
         window.autoUpdateTest.calls.push({ command, args });
         const result = await invoke(command, args, options);
         if (command === 'get_auto_update_status' && window.autoUpdateTest.override) return { ...result, ...window.autoUpdateTest.override };
+        if (command === 'check_app_update' && window.autoUpdateTest.appUnsupported) {
+          return { ...result, autoUpdateSupported: false, unsupportedReason: 'Application package is unavailable' };
+        }
         return result;
       };
       window.dispatchEvent(new CustomEvent('app:navigate', { detail: 'config' }));
@@ -53,10 +56,12 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
     const panel = page.locator('.auto-update-panel');
     const save = panel.getByRole('button', { name: 'Save', exact: true });
     const enabled = panel.getByRole('switch', { name: 'Enable automatic updates' });
-    await save.waitFor();
+    await enabled.waitFor();
     await page.clock.install({ time: new Date('2026-11-17T14:00:00Z') });
     assert.equal(await enabled.isChecked(), false);
+    assert.equal(await save.count(), 0, 'no save action while the setting is unchanged');
     await enabled.check();
+    await save.waitFor();
     await save.click();
     await panel.getByText('Select the application or core.', { exact: true }).waitFor();
     await panel.getByRole('checkbox', { name: 'Application', exact: true }).check();
@@ -91,7 +96,7 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
     await page.clock.fastForward(5100);
     await panel.getByText('Installing the update', { exact: true }).waitFor();
     assert.equal(await enabled.isDisabled(), true);
-    assert.equal(await save.isDisabled(), true);
+    assert.equal(await save.count(), 0, 'installing hides a Save that has nothing to commit');
     await page.evaluate(() => { window.autoUpdateTest.override = { phase: 'failed', error: 'Install failed' }; });
     await page.clock.fastForward(5100);
     await panel.getByText('Install failed', { exact: true }).waitFor();
@@ -101,6 +106,20 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
     await enabled.uncheck(); await save.click();
     await panel.getByText('Waiting for a newer version', { exact: true }).waitFor({ state: 'hidden' });
     assert.equal(await enabled.isChecked(), false);
+    await page.evaluate(() => { window.autoUpdateTest.appUnsupported = true; });
+    await page.locator('.app-module-card').getByRole('button', { name: 'Check for Updates' }).click();
+    await panel.getByText('Application package is unavailable', { exact: true }).waitFor();
+    await enabled.check();
+    await panel.getByRole('checkbox', { name: 'Application', exact: true }).uncheck();
+    await core.check();
+    await save.click();
+    await panel.getByText('Waiting for a newer version', { exact: true }).waitFor();
+    assert.deepEqual(await page.evaluate(() => window.autoUpdateTest.calls.filter(call => call.command === 'set_auto_update_settings').at(-1).args.settings), {
+      enabled: true, updateApp: false, updateCore: true,
+    }, 'core settings can still be saved when the application cannot update');
+    await enabled.uncheck();
+    await save.click();
+    await panel.getByText('Waiting for a newer version', { exact: true }).waitFor({ state: 'hidden' });
     await page.evaluate(() => window.dispatchEvent(new CustomEvent('app:navigate', { detail: 'config' })));
     await page.locator('#config-subpage-tab-software').click();
     assert.equal(await panel.count(), 0);
@@ -121,6 +140,8 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
     await preview.addStyleTag({ content: '#browser-mock-toolbar { display: none; }' });
     await preview.evaluate(() => window.dispatchEvent(new CustomEvent('app:navigate', { detail: 'versions' })));
     const previewPanel = preview.locator('.auto-update-panel');
+    await previewPanel.getByRole('switch').waitFor();
+    await previewPanel.getByRole('switch').check();
     await previewPanel.getByRole('button', { name: '保存', exact: true }).waitFor();
     await previewPanel.screenshot({ path: path.join(output, 'dense-panel-zh.png') });
     await preview.screenshot({ path: path.join(output, 'dense-version-page-zh.png') });

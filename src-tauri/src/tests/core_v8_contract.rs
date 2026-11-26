@@ -514,6 +514,80 @@ async fn v8_accepts_gui_settings_and_reloads_client_keys() {
 
 #[tokio::test]
 #[ignore = "requires CPA_V8_TEST_CORE pointing to a v8 executable"]
+async fn v8_config_document_conditional_raw_yaml_and_readback() {
+    use remote_cpa::config_document::{put_yaml, read_yaml, DocumentError};
+    let executable = fs::canonicalize(env::var_os("CPA_V8_TEST_CORE").unwrap()).unwrap();
+    let directory = agent_test_home("v8-contract-config-document");
+    let bind = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = bind.local_addr().unwrap().port();
+    let mut core = TestCore {
+        config: directory.join("config.yaml"), directory, child: None, executable,
+        origin: format!("http://127.0.0.1:{port}"),
+        client: reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(3)).build().unwrap(),
+    };
+    fs::create_dir_all(core.directory.join("auth")).unwrap();
+    fs::write(&core.config, format!("config-version: 8\nserver: {{host: 127.0.0.1, port: {port}}}\nmanagement: {{secret-key: isolated-test-secret, disable-control-panel: true}}\noauth: {{auth-dir: ./auth}}\nrouting:\n  strategy: round-robin\n")).unwrap();
+    drop(bind);
+    core.start().await;
+    let target = remote_cpa::Target::new(&core.origin, "isolated-test-secret").unwrap();
+    let baseline = read_yaml(&target).await.unwrap();
+    let etag = baseline.etag.unwrap();
+    let draft = baseline.yaml.replace("strategy: round-robin", "strategy: fill-first");
+    assert_ne!(draft, baseline.yaml);
+    let saved_etag = put_yaml(&target, &etag, draft).await.unwrap().unwrap();
+    assert_eq!(put_yaml(&target, &etag, baseline.yaml).await, Err(DocumentError::Conflict));
+    let saved = read_yaml(&target).await.unwrap();
+    assert_eq!(saved.etag.as_deref(), saved_etag.to_str().ok());
+    assert_eq!(saved.yaml, fs::read_to_string(&core.config).unwrap());
+    assert!(saved.yaml.contains("strategy: fill-first"));
+}
+
+#[tokio::test]
+#[ignore = "requires CPA_V8_TEST_CORE pointing to a v8 executable"]
+async fn three_v8_instances_keep_selected_queue_and_database_isolated() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let executable = fs::canonicalize(std::env::var_os("CPA_V8_TEST_CORE").unwrap()).unwrap();
+    let mut instances = Vec::new();
+    for index in 0..3 {
+        let bind = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = bind.local_addr().unwrap().port();
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let directory = agent_test_home(&format!("v8-contract-instance-{index}"));
+        let gui = GuiConfigFile { host: "127.0.0.1".into(), port, management_secret_key: "isolated-test-secret".into(), auth_dir: path_to_string(&directory.join("auth")), usage_statistics_enabled: true, ..GuiConfigFile::default() };
+        fs::create_dir_all(&gui.auth_dir).unwrap();
+        let mut core = TestCore { config: directory.join("config.yaml"), directory, child: None, executable: executable.clone(), origin: format!("http://127.0.0.1:{port}"), client: reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap() };
+        let initial = format!("remote-management: {{disable-control-panel: true, disable-auto-update-panel: true}}\nopenai-compatibility:\n  - name: fixture\n    base-url: http://{upstream_address}/v1\n    api-key-entries: [{{api-key: upstream-test}}]\n    models: [{{name: same-model, alias: same-model}}]\n");
+        fs::write(&core.config, apply_gui_managed_settings(&initial,&gui).unwrap()).unwrap();
+        drop(bind);
+        core.start().await;
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket,_) = upstream.accept().await.unwrap();
+            let mut buf = [0;8192]; assert!(socket.read(&mut buf).await.unwrap()>0);
+            let body = serde_json::json!({"id":"fixture","object":"chat.completion","model":"same-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":index+1,"completion_tokens":1,"total_tokens":index+2}}).to_string();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        });
+        core.client.post(format!("{}/v1/chat/completions",core.origin)).bearer_auth(&gui.api_keys[0].key).json(&serde_json::json!({"model":"same-model","messages":[{"role":"user","content":"test"}]})).send().await.unwrap().error_for_status().unwrap().bytes().await.unwrap();
+        upstream_task.await.unwrap();
+        let target = (index != 0).then(|| remote_cpa::Target::new(&core.origin,"isolated-test-secret").unwrap());
+        instances.push((core,gui,target));
+    }
+    let root = instances[0].0.directory.join("usage-records");
+    for (index,(_,gui,target)) in instances.iter().enumerate() {
+        assert_eq!(usage::fixture_usage_totals(&root,target.as_ref(),gui,false).await.unwrap(),(0,0));
+        let collected = tokio::time::timeout(Duration::from_secs(5),async {
+            loop { let totals = usage::fixture_usage_totals(&root,target.as_ref(),gui,true).await.unwrap(); if totals.0 > 0 { break totals; } tokio::time::sleep(Duration::from_millis(50)).await; }
+        }).await.unwrap();
+        assert_eq!(collected,(1,index as u64+2));
+    }
+    for (index,(core,gui,target)) in instances.iter_mut().enumerate() {
+        core.stop();
+        assert_eq!(usage::fixture_usage_totals(&root,target.as_ref(),gui,false).await.unwrap(),(1,index as u64+2));
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires CPA_V8_TEST_CORE pointing to a v8 executable"]
 async fn v8_reloads_usage_after_repeated_gui_saves_in_both_config_layouts() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

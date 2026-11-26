@@ -39,7 +39,7 @@ pub(crate) fn build_pi_template_updates(
     Ok(vec![
         AgentFileUpdate {
             path: pi_provider_config_path(home),
-            after: build_pi_provider_config(None, &managed_core_loopback_origin(port), api_key)?,
+            after: build_pi_provider_config(None, &agent_effective_loopback_origin(PI_AGENT_ID, port), api_key)?,
         },
         AgentFileUpdate {
             path: pi_provider_settings_path(home),
@@ -275,6 +275,8 @@ async fn execute_template_plan(
 
 #[tauri::command]
 pub(crate) async fn preview_agent_config_template(
+    remote: tauri::State<'_, crate::remote_cpa::RemoteCpaState>,
+    target_revision: Option<u32>,
     app: tauri::AppHandle,
     client: String,
     model: String,
@@ -284,6 +286,7 @@ pub(crate) async fn preview_agent_config_template(
     api_key: Option<String>,
     config_directories: Option<AgentConfigDirectories>,
 ) -> Result<TemplatePreview, String> {
+    remote.agent_operation(target_revision, api_key.clone(), async move {
     let directories = validate_agent_config_directories(config_directories)?;
     AGENT_CONFIG_DIRECTORIES
         .scope(directories, async move {
@@ -299,6 +302,7 @@ pub(crate) async fn preview_agent_config_template(
             .await
         })
         .await
+    }).await
 }
 
 pub(crate) async fn preview_agent_config_template_in_directories(
@@ -328,6 +332,8 @@ pub(crate) async fn preview_agent_config_template_in_directories(
 
 #[tauri::command]
 pub(crate) async fn apply_agent_config_template(
+    remote: tauri::State<'_, crate::remote_cpa::RemoteCpaState>,
+    target_revision: Option<u32>,
     app: tauri::AppHandle,
     client: String,
     model: String,
@@ -338,6 +344,7 @@ pub(crate) async fn apply_agent_config_template(
     api_key: Option<String>,
     config_directories: Option<AgentConfigDirectories>,
 ) -> Result<AgentConfigActionResult, String> {
+    remote.agent_operation(target_revision, api_key.clone(), async move {
     let directories = validate_agent_config_directories(config_directories)?;
     AGENT_CONFIG_DIRECTORIES
         .scope(directories, async move {
@@ -354,6 +361,7 @@ pub(crate) async fn apply_agent_config_template(
             .await
         })
         .await
+    }).await
 }
 
 pub(crate) async fn apply_agent_config_template_in_directories(

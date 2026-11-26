@@ -8,6 +8,7 @@ import { pollWhileActive } from '../services/windowActivity';
 import {
   getCoreConfigSettings,
   getSoftwareSettings,
+  saveCoreProxySettings,
   getCoreTlsSettings,
   setCoreManagementSecretKey,
   clearCoreManagementSecretKey,
@@ -23,6 +24,8 @@ import {
   saveSessionRoutingSettings as saveSessionRoutingSettingsCommand,
   saveSoftwareSettings as saveSoftwareSettingsCommand,
 } from '../services/coreSettings';
+import { managementApi } from '../services/managementApi';
+import { selectedRemoteEndpoint } from '../services/remoteCpa';
 import type { CoreConfigSettings, CoreApiKey, SoftwareSettings, CloseBehavior, CoreTlsSettings } from '../services/coreSettings';
 import {
   getReverseProxyState,
@@ -71,12 +74,12 @@ import { useI18n } from '../i18n';
 import { MessageNotice, FloatingNotice, useAppNotice } from '../appNotice';
 import { webUiManagementUrl } from '../services/clientAccess';
 import { ThinkingAliasesPage } from './ThinkingAliasesPage';
-import { SensitiveWordsPage } from './SensitiveWordsPage';
+import { SensitiveWordsPage, type SensitiveWordsPageHandle } from './SensitiveWordsPage';
 import { Tabs } from '../components/Tabs';
 import { SegmentedControl } from '../components/SegmentedControl';
 import { Dialog } from '../components/Dialog';
 import { useConfirmation } from '../components/ConfirmationDialog';
-import { TemplateConfigSection } from '../components/TemplateConfigSection';
+import { TemplateConfigSection, type TemplateConfigSectionHandle } from '../components/TemplateConfigSection';
 import { SettingsHelp } from '../components/SettingsHelp';
 import { templateMessages, templateText } from '../i18n/templateConfig';
 import {
@@ -91,23 +94,53 @@ type ConfigAction =
   | 'update-key'
   | 'delete-key'
   | 'management-secret'
+  | 'outbound-proxy'
   | 'logging'
   | 'open-logs'
   | 'routing'
   | 'network'
   | 'retry'
   | 'tls'
-  | 'software'
   | null;
 type ConfigSubpage = SettingsCategory;
+
+type SoftwarePreferenceValues = {
+  closeBehavior: CloseBehavior;
+  autostartEnabled: boolean;
+  startCoreOnLaunch: boolean;
+  silentStartEnabled: boolean;
+  defaultTerminal: string;
+};
+
+const DEFAULT_SOFTWARE_PREFERENCES: SoftwarePreferenceValues = {
+  closeBehavior: 'ask',
+  autostartEnabled: false,
+  startCoreOnLaunch: true,
+  silentStartEnabled: false,
+  defaultTerminal: 'auto',
+};
+
+const pickSoftwarePreferences = (source: SoftwareSettings): SoftwarePreferenceValues => ({
+  closeBehavior: source.closeBehavior,
+  autostartEnabled: source.autostartEnabled,
+  startCoreOnLaunch: source.startCoreOnLaunch,
+  silentStartEnabled: source.silentStartEnabled,
+  defaultTerminal: source.defaultTerminal,
+});
+
+const sameSoftwarePreferences = (a: SoftwarePreferenceValues, b: SoftwarePreferenceValues) => (
+  a.closeBehavior === b.closeBehavior
+  && a.autostartEnabled === b.autostartEnabled
+  && a.startCoreOnLaunch === b.startCoreOnLaunch
+  && a.silentStartEnabled === b.silentStartEnabled
+  && a.defaultTerminal === b.defaultTerminal
+);
 type SettingDestination = { category: ConfigSubpage; target: string; field?: string };
 type SettingSearchEntry = SettingDestination & { title: string; context: string; keywords: string };
 
 type NetworkDraftField =
   | 'port'
   | 'host'
-  | 'proxyUrl'
-  | 'proxyOverride'
   | 'sessionAffinity'
   | 'sessionTtl'
   | 'disableCooling'
@@ -122,8 +155,6 @@ type NetworkDraftDirty = Record<NetworkDraftField, boolean>;
 const cleanNetworkDraft = (): NetworkDraftDirty => ({
   port: false,
   host: false,
-  proxyUrl: false,
-  proxyOverride: false,
   sessionAffinity: false,
   sessionTtl: false,
   disableCooling: false,
@@ -151,21 +182,21 @@ const DEFAULT_REVERSE_PROXY_DRAFT: ReverseProxyConfig = {
 };
 
 const isValidPort = (value: number) => Number.isInteger(value) && value >= 1 && value <= 65535;
+const isInvalidListenHost = (value: string) => /[\s/\\]|^[^:]+:\d+$/.test(value);
 
-type ReverseProxyFieldError = Partial<Record<'listenPort' | 'targetPort' | 'certPath' | 'keyPath', string>>;
+type ReverseProxyFieldError = Partial<Record<'listenHost' | 'listenPort' | 'targetPort' | 'certPath' | 'keyPath', string>>;
 
 export function ConfigPanelPage() {
   const { t, locale } = useI18n();
+  const external = Boolean(selectedRemoteEndpoint());
+  const [serverLogs, setServerLogs] = useState<string[] | null>(null);
   const { askConfirmation, confirmationDialog } = useConfirmation();
   const { status: coreStatus, publishStatus, refreshStatus } = useCoreRuntime();
   const [settings, setSettings] = useState<CoreConfigSettings | null>(null);
   const [softwareSettings, setSoftwareSettings] = useState<SoftwareSettings | null>(null);
   const [softwareSettingsLoading, setSoftwareSettingsLoading] = useState(true);
-  const [softwareCloseBehaviorDraft, setSoftwareCloseBehaviorDraft] = useState<CloseBehavior>('ask');
-  const [softwareAutostartDraft, setSoftwareAutostartDraft] = useState(false);
-  const [softwareStartCoreDraft, setSoftwareStartCoreDraft] = useState(true);
-  const [softwareSilentStartDraft, setSoftwareSilentStartDraft] = useState(false);
-  const [softwareDefaultTerminalDraft, setSoftwareDefaultTerminalDraft] = useState('auto');
+  const [softwareValues, setSoftwareValues] = useState<SoftwarePreferenceValues>(DEFAULT_SOFTWARE_PREFERENCES);
+  const [softwareSaving, setSoftwareSaving] = useState(false);
   const [softwareSavedStatusVisible, setSoftwareSavedStatusVisible] = useState(false);
   const [tlsSettings, setTlsSettings] = useState<CoreTlsSettings | null>(null);
   const [tlsSettingsLoading, setTlsSettingsLoading] = useState(true);
@@ -188,7 +219,10 @@ export function ConfigPanelPage() {
   const [managementSecretDraft, setManagementSecretDraft] = useState('');
   const [managementSecretConfirm, setManagementSecretConfirm] = useState('');
   const [showManagementSecret, setShowManagementSecret] = useState(false);
+  const [revealedKeyMap, setRevealedKeyMap] = useState<Record<string, boolean>>({});
   const [managementSecretError, setManagementSecretError] = useState('');
+  const [outboundProxyDraft, setOutboundProxyDraft] = useState<Pick<CoreConfigSettings, 'proxyUrl' | 'proxyOverride'> | null>(null);
+  const [outboundProxyError, setOutboundProxyError] = useState(false);
   const [debugDraft, setDebugDraft] = useState(false);
   const [commercialModeDraft, setCommercialModeDraft] = useState(false);
   const [loggingToFileDraft, setLoggingToFileDraft] = useState(false);
@@ -202,13 +236,14 @@ export function ConfigPanelPage() {
   const managementFeedback = useAppNotice();
   const loggingFeedback = useAppNotice();
   const networkFeedback = useAppNotice();
+  const outboundProxyFeedback = useAppNotice();
   const routingFeedback = useAppNotice();
   const retryFeedback = useAppNotice();
   const tlsFeedback = useAppNotice();
   const proxyFeedback = useAppNotice();
   const softwareFeedback = useAppNotice();
-  const renderFeedback = (feedback: ReturnType<typeof useAppNotice>) => (
-    <FloatingNotice key={feedback.revision} notice={feedback.notice} onDismiss={feedback.clearNotice} />
+  const renderFeedback = (feedback: ReturnType<typeof useAppNotice>, visible = true) => (
+    visible ? <FloatingNotice key={feedback.revision} notice={feedback.notice} onDismiss={feedback.clearNotice} /> : null
   );
   const [activeSubpage, setActiveSubpage] = useState<ConfigSubpage>('general');
   const [settingsSearch, setSettingsSearch] = useState('');
@@ -217,8 +252,11 @@ export function ConfigPanelPage() {
   const [sensitiveWordsVisited, setSensitiveWordsVisited] = useState(false);
   const [aliasesVisited, setAliasesVisited] = useState(false);
   const [pendingDestination, setPendingDestination] = useState<SettingDestination | null>(null);
+  const [savingAll, setSavingAll] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
   const categoryNavigationRef = useRef<HTMLDivElement>(null);
+  const templateSectionRef = useRef<TemplateConfigSectionHandle>(null);
+  const sensitiveWordsRef = useRef<SensitiveWordsPageHandle>(null);
   const st = (key: keyof typeof settingsMessages) => templateText(settingsMessages[key], locale);
   const searching = settingsSearch.trim().length > 0;
 
@@ -276,8 +314,6 @@ export function ConfigPanelPage() {
   }, [pendingDestination]);
   const [portDraft, setPortDraft] = useState('8317');
   const [hostDraft, setHostDraft] = useState('127.0.0.1');
-  const [proxyUrlDraft, setProxyUrlDraft] = useState('');
-  const [proxyOverrideDraft, setProxyOverrideDraft] = useState(false);
   const [sessionAffinityDraft, setSessionAffinityDraft] = useState(false);
   const [sessionTtlDraft, setSessionTtlDraft] = useState('');
   const [disableCoolingDraft, setDisableCoolingDraft] = useState(true);
@@ -287,14 +323,19 @@ export function ConfigPanelPage() {
   const [streamingBootstrapRetriesDraft, setStreamingBootstrapRetriesDraft] = useState('0');
   const [portError, setPortError] = useState('');
   const [hostError, setHostError] = useState('');
-  const [proxyUrlError, setProxyUrlError] = useState('');
   const [sessionTtlError, setSessionTtlError] = useState('');
   const [proxyFieldErrors, setProxyFieldErrors] = useState<ReverseProxyFieldError>({});
   const [retryError, setRetryError] = useState('');
   const networkDraftDirtyRef = useRef<NetworkDraftDirty>(cleanNetworkDraft());
   const loggingDraftDirtyRef = useRef(false);
-  const otherDraftDirtyRef = useRef({ software: false, tls: false });
+  const otherDraftDirtyRef = useRef({ tls: false });
   const copyTimerRef = useRef<number | null>(null);
+  const mountedRef = useRef(true);
+  const softwarePersistedRef = useRef<SoftwareSettings | null>(null);
+  const softwareDesiredRef = useRef<SoftwarePreferenceValues | null>(null);
+  const softwareSaveInFlightRef = useRef(false);
+  const softwareMutationSeqRef = useRef(0);
+  const softwareSavedTimerRef = useRef<number | null>(null);
 
   const [proxyState, setProxyState] = useState<ReverseProxyState | null>(null);
   const [proxyInitialLoading, setProxyInitialLoading] = useState(true);
@@ -304,7 +345,35 @@ export function ConfigPanelPage() {
   const [proxyFileSelecting, setProxyFileSelecting] = useState<'cert' | 'key' | null>(null);
   const proxyFileSelectingRef = useRef(false);
   const [proxyDraft, setProxyDraft] = useState<ReverseProxyConfig>(DEFAULT_REVERSE_PROXY_DRAFT);
+  const [listenPortInput, setListenPortInput] = useState(() => String(DEFAULT_REVERSE_PROXY_DRAFT.listenPort));
+  const [targetPortInput, setTargetPortInput] = useState(() => String(DEFAULT_REVERSE_PROXY_DRAFT.targetPort));
   const [proxyLanIp, setProxyLanIp] = useState<string | null>(null);
+
+  const normalizePortDigits = (raw: string): string =>
+    raw
+      .replace(/[０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+      .replace(/\D/g, '')
+      .slice(0, 5);
+
+  const syncProxyPortInputs = (config: ReverseProxyConfig) => {
+    setListenPortInput(config.listenPort > 0 ? String(config.listenPort) : '');
+    setTargetPortInput(config.targetPort > 0 ? String(config.targetPort) : '');
+  };
+
+  const updateProxyPortInput = (field: 'listenPort' | 'targetPort', rawValue: string, composing = false) => {
+    if (composing) {
+      if (field === 'listenPort') setListenPortInput(rawValue);
+      else setTargetPortInput(rawValue);
+      return;
+    }
+    const digits = normalizePortDigits(rawValue);
+    if (field === 'listenPort') setListenPortInput(digits);
+    else setTargetPortInput(digits);
+    const parsed = digits ? Number.parseInt(digits, 10) : 0;
+    setProxyDraft(prev => ({ ...prev, [field]: Number.isNaN(parsed) ? 0 : parsed }));
+    setProxyDirty(true);
+    clearProxyFieldError(field);
+  };
 
   const loadReverseProxy = async () => {
     setProxyInitialLoading(true);
@@ -317,11 +386,11 @@ export function ConfigPanelPage() {
       setProxyLanIp(lanIp);
       if (state.config) {
         setProxyDraft({ ...DEFAULT_REVERSE_PROXY_DRAFT, ...state.config });
+        syncProxyPortInputs({ ...DEFAULT_REVERSE_PROXY_DRAFT, ...state.config });
       }
       setBackendNotReady(false);
-    } catch (error) {
+    } catch {
       setBackendNotReady(true);
-      proxyFeedback.showNotice(String(error), 'error');
     } finally {
       setProxyInitialLoading(false);
     }
@@ -331,6 +400,10 @@ export function ConfigPanelPage() {
     const errors: ReverseProxyFieldError = {};
     // Ports stay validated while disabled so an already stopped proxy reports
     // field errors instead of silently discarding an unusable draft.
+    const hostCandidate = draft.listenHost.trim().replace(/^\[|\]$/g, '');
+    if (hostCandidate && isInvalidListenHost(hostCandidate)) {
+      errors.listenHost = st('reverseProxyListenHostInvalid');
+    }
     if (!isValidPort(draft.listenPort)) {
       errors.listenPort = t('config.error.portRange');
     }
@@ -372,11 +445,15 @@ export function ConfigPanelPage() {
     }
   };
 
-  const handleProxySave = async () => {
-    if (proxyControlsDisabled || proxyFileSelectingRef.current) return;
+  const handleProxySave = async (): Promise<boolean> => {
+    if (proxyControlsDisabled || proxyFileSelectingRef.current) return false;
+    const parsedListenPort = Number.parseInt(normalizePortDigits(listenPortInput), 10);
+    const parsedTargetPort = Number.parseInt(normalizePortDigits(targetPortInput), 10);
     const normalizedDraft = {
       ...proxyDraft,
-      listenHost: proxyDraft.listenHost.trim() || '0.0.0.0',
+      listenPort: Number.isNaN(parsedListenPort) ? 0 : parsedListenPort,
+      targetPort: Number.isNaN(parsedTargetPort) ? 0 : parsedTargetPort,
+      listenHost: proxyDraft.listenHost.trim().replace(/^\[|\]$/g, '') || '0.0.0.0',
       certPath: proxyDraft.certPath.trim(),
       keyPath: proxyDraft.keyPath.trim(),
     };
@@ -386,17 +463,26 @@ export function ConfigPanelPage() {
     setProxyFieldErrors(fieldErrors);
     if (Object.keys(fieldErrors).length > 0) {
       proxyFeedback.showNotice(Object.values(fieldErrors)[0], 'error');
-      return;
+      return false;
     }
     setProxyDraft(saveConfig);
+    syncProxyPortInputs(saveConfig);
     setProxyAction('save');
     try {
       const state = await applyReverseProxyConfig(saveConfig);
       setProxyState(state);
-      if (state.config) setProxyDraft(state.config);
+      if (state.config) {
+        setProxyDraft(state.config);
+        syncProxyPortInputs(state.config);
+      }
+      if (saveConfig.enabled) {
+        void loadSettings('preserve');
+        void refreshStatus();
+      }
       setBackendNotReady(false);
       setProxyDirty(false);
       proxyFeedback.showNotice(state.error || st('reverseProxySaved'), state.error ? 'error' : 'success');
+      return !state.error;
     } catch (error) {
       setProxyFieldErrors(prev => ({ ...prev, ...reverseProxyPathErrors(error) }));
       proxyFeedback.showNotice(String(error), 'error');
@@ -406,6 +492,7 @@ export function ConfigPanelPage() {
       } catch {
         setBackendNotReady(true);
       }
+      return false;
     } finally {
       setProxyAction(null);
     }
@@ -446,7 +533,7 @@ export function ConfigPanelPage() {
   };
 
   useEffect(() => {
-    if (activeSubpage !== 'proxy' || proxyAction !== null || proxyInitialLoading) return;
+    if (external || activeSubpage !== 'proxy' || proxyAction !== null || proxyInitialLoading) return;
     let disposed = false;
     const stopPolling = pollWhileActive(() => {
       void getReverseProxyState().then(state => {
@@ -459,15 +546,16 @@ export function ConfigPanelPage() {
       disposed = true;
       stopPolling();
     };
-  }, [activeSubpage, proxyAction, proxyInitialLoading]);
+  }, [external, activeSubpage, proxyAction, proxyInitialLoading]);
 
   useEffect(() => {
+    mountedRef.current = true;
     let disposed = false;
     let stop: (() => void) | null = null;
     void loadSettings();
     void loadSoftwareSettings();
     void loadTlsSettings();
-    void loadReverseProxy();
+    if (!external) void loadReverseProxy();
     void onConfigFilesChanged(() => {
       if (!disposed) {
         void loadSettings('preserve');
@@ -479,10 +567,15 @@ export function ConfigPanelPage() {
       else stop = unlisten;
     });
     return () => {
+      mountedRef.current = false;
       disposed = true;
       stop?.();
       if (copyTimerRef.current !== null) {
         window.clearTimeout(copyTimerRef.current);
+      }
+      if (softwareSavedTimerRef.current !== null) {
+        window.clearTimeout(softwareSavedTimerRef.current);
+        softwareSavedTimerRef.current = null;
       }
     };
   }, []);
@@ -493,8 +586,6 @@ export function ConfigPanelPage() {
       const dirty = networkDraftDirtyRef.current;
       if (!dirty.port) setPortDraft(String(result.port));
       if (!dirty.host) setHostDraft(result.host);
-      if (!dirty.proxyUrl) setProxyUrlDraft(result.proxyUrl);
-      if (!dirty.proxyOverride) setProxyOverrideDraft(result.proxyOverride);
       if (!dirty.sessionAffinity) setSessionAffinityDraft(result.routingSessionAffinity);
       if (!dirty.sessionTtl) setSessionTtlDraft(result.routingSessionAffinityTtl);
       if (!dirty.disableCooling) setDisableCoolingDraft(result.disableCooling);
@@ -519,8 +610,6 @@ export function ConfigPanelPage() {
     loggingDraftDirtyRef.current = false;
     setPortDraft(String(result.port));
     setHostDraft(result.host);
-    setProxyUrlDraft(result.proxyUrl);
-    setProxyOverrideDraft(result.proxyOverride);
     setSessionAffinityDraft(result.routingSessionAffinity);
     setSessionTtlDraft(result.routingSessionAffinityTtl);
     setDisableCoolingDraft(result.disableCooling);
@@ -537,7 +626,6 @@ export function ConfigPanelPage() {
     setRedisUsageRetentionDraft(String(result.redisUsageQueueRetentionSeconds));
     setPortError('');
     setHostError('');
-    setProxyUrlError('');
     setSessionTtlError('');
     setProxyFieldErrors({});
     setRetryError('');
@@ -572,24 +660,30 @@ export function ConfigPanelPage() {
   }
 
   async function loadSoftwareSettings(mode: DraftRefreshMode = 'replace') {
+    const seqAtStart = softwareMutationSeqRef.current;
     if (mode === 'replace') {
       setSoftwareSettingsLoading(true);
       setSoftwareSavedStatusVisible(false);
     }
     try {
       const result = await getSoftwareSettings();
-      if (mode === 'preserve' && otherDraftDirtyRef.current.software) return;
+      if (!mountedRef.current) return;
+      if (mode === 'preserve' && (softwareSaveInFlightRef.current || softwareMutationSeqRef.current !== seqAtStart)) return;
+      softwarePersistedRef.current = result;
+      const nextValues = pickSoftwarePreferences(result);
+      softwareDesiredRef.current = nextValues;
       setSoftwareSettings(result);
-      setSoftwareCloseBehaviorDraft(result.closeBehavior);
-      setSoftwareAutostartDraft(result.autostartEnabled);
-      setSoftwareStartCoreDraft(result.startCoreOnLaunch);
-      setSoftwareSilentStartDraft(result.silentStartEnabled);
-      setSoftwareDefaultTerminalDraft(result.defaultTerminal);
+      setSoftwareValues(nextValues);
     } catch (error) {
-      setSoftwareSettings(null);
+      if (!mountedRef.current) return;
+      if (mode === 'replace') {
+        softwarePersistedRef.current = null;
+        softwareDesiredRef.current = null;
+        setSoftwareSettings(null);
+      }
       softwareFeedback.showNotice({ key: 'config.error.saveFailed', variables: { error: String(error) } }, 'error');
     } finally {
-      setSoftwareSettingsLoading(false);
+      if (mountedRef.current) setSoftwareSettingsLoading(false);
     }
   }
 
@@ -620,7 +714,7 @@ export function ConfigPanelPage() {
     setBusyAction(action);
     const mutationFeedback = action === 'management-secret'
       ? managementFeedback
-      : action === 'routing' ? routingFeedback : keyFeedback;
+      : action === 'outbound-proxy' ? outboundProxyFeedback : action === 'routing' ? routingFeedback : keyFeedback;
     mutationFeedback.clearNotice();
     try {
       const result = await mutation();
@@ -676,6 +770,36 @@ export function ConfigPanelPage() {
     setFormError('');
   };
 
+  const outboundProxy = outboundProxyDraft ?? settings ?? { proxyUrl: '', proxyOverride: false };
+  const detectedProxyUrl = settings && !settings.proxyOverride ? settings.proxyUrl : '';
+  const outboundProxyDirty = settings !== null && (outboundProxy.proxyOverride !== settings.proxyOverride
+    || (outboundProxy.proxyOverride && outboundProxy.proxyUrl.trim() !== settings.proxyUrl));
+  const outboundProxyDisabled = loading || !settings || busyAction !== null;
+
+  const updateOutboundProxy = (draft: typeof outboundProxyDraft) => {
+    setOutboundProxyDraft(draft);
+    setOutboundProxyError(false);
+    outboundProxyFeedback.clearNotice();
+  };
+
+  const performSaveOutboundProxy = async (): Promise<boolean> => {
+    if (outboundProxyDisabled || !outboundProxyDirty) return false;
+    const proxyUrl = outboundProxy.proxyOverride ? outboundProxy.proxyUrl.trim() : '';
+    if (proxyUrl && !/^(https?|socks|socks5h?):\/\//i.test(proxyUrl)) {
+      outboundProxyFeedback.clearNotice();
+      setOutboundProxyError(true);
+      return false;
+    }
+    const saved = await runMutation('outbound-proxy', () => saveCoreProxySettings(proxyUrl, outboundProxy.proxyOverride), st('outboundProxySaved'));
+    if (saved) setOutboundProxyDraft(null);
+    return saved;
+  };
+
+  const saveOutboundProxy = async (event: FormEvent) => {
+    event.preventDefault();
+    await performSaveOutboundProxy();
+  };
+
   const generateManagementSecret = () => {
     const bytes = new Uint8Array(24);
     crypto.getRandomValues(bytes);
@@ -687,24 +811,30 @@ export function ConfigPanelPage() {
     setManagementSecretError('');
   };
 
-  const saveManagementSecret = async (event: FormEvent) => {
-    event.preventDefault();
+  const discardManagementSecretDraft = () => {
+    setManagementSecretDraft('');
+    setManagementSecretConfirm('');
+    setShowManagementSecret(false);
+    setManagementSecretError('');
+  };
+
+  const performSaveManagementSecret = async (): Promise<boolean> => {
     const secretKey = managementSecretDraft.trim();
     if (!secretKey) {
       setManagementSecretError(t('config.webuiKey.error.empty'));
-      return;
+      return false;
     }
     if (secretKey.length > 512) {
       setManagementSecretError(t('config.webuiKey.error.tooLong'));
-      return;
+      return false;
     }
     if (/[\u0000-\u001f\u007f-\u009f]/.test(secretKey)) {
       setManagementSecretError(t('config.webuiKey.error.invalid'));
-      return;
+      return false;
     }
     if (secretKey !== managementSecretConfirm.trim()) {
       setManagementSecretError(t('config.webuiKey.error.mismatch'));
-      return;
+      return false;
     }
 
     const saved = await runMutation(
@@ -718,6 +848,12 @@ export function ConfigPanelPage() {
       setShowManagementSecret(false);
       setManagementSecretError('');
     }
+    return saved;
+  };
+
+  const saveManagementSecret = async (event: FormEvent) => {
+    event.preventDefault();
+    await performSaveManagementSecret();
   };
 
   const disableManagement = async () => {
@@ -769,8 +905,8 @@ export function ConfigPanelPage() {
     }
   };
 
-  const saveCoreLoggingSettings = async () => {
-    if (!settings || busyAction !== null) return;
+  const saveCoreLoggingSettings = async (): Promise<boolean> => {
+    if (!settings || busyAction !== null) return false;
     loggingFeedback.clearNotice();
     const logsMaxTotalSizeMb = Number(logsMaxTotalSizeDraft);
     const errorLogsMaxFiles = Number(errorLogsMaxFilesDraft);
@@ -785,7 +921,7 @@ export function ConfigPanelPage() {
     ) {
       const message = t('config.diagnostics.error.nonNegativeInteger');
       setLoggingError(message);
-      return;
+      return false;
     }
     if (
       !Number.isInteger(redisUsageQueueRetentionSeconds)
@@ -794,7 +930,7 @@ export function ConfigPanelPage() {
     ) {
       const message = t('config.diagnostics.error.redisRetention');
       setLoggingError(message);
-      return;
+      return false;
     }
 
     const commercialModeChanged = commercialModeDraft !== settings.commercialMode;
@@ -802,6 +938,7 @@ export function ConfigPanelPage() {
     setLoggingError('');
     try {
       const result = await saveCoreLoggingSettingsCommand({
+        expected: settings,
         settings: {
           debug: debugDraft,
           commercialMode: commercialModeDraft,
@@ -814,18 +951,20 @@ export function ConfigPanelPage() {
       });
       loggingDraftDirtyRef.current = false;
       applySettings(result, 'preserve');
-      if (commercialModeChanged && coreStatus?.running) {
+      if (commercialModeChanged && !selectedRemoteEndpoint() && coreStatus?.running) {
         const status = await restartCoreProcess();
         publishStatus(status);
         loggingFeedback.showNotice({ key: 'config.diagnostics.notice.savedAndRestarted' }, 'success');
       } else {
         loggingFeedback.showNotice({ key: 'config.diagnostics.notice.saved' }, 'success');
       }
+      return true;
     } catch (error) {
       const message = t('config.error.saveFailed', { error: String(error) });
       setLoggingError(message);
       void refreshStatus();
       void loadSettings('preserve');
+      return false;
     } finally {
       setBusyAction(null);
     }
@@ -835,7 +974,11 @@ export function ConfigPanelPage() {
     if (busyAction !== null) return;
     setBusyAction('open-logs');
     try {
-      await openCoreLogsDirectory();
+      if (external) {
+        const result = await managementApi.get<{ lines: string[] }>('/observability/logs', { limit: 200 });
+        if (!Array.isArray(result?.lines) || !result.lines.every(line => typeof line === 'string')) throw new Error(t('remote.error.invalidResponse'));
+        setServerLogs(result.lines);
+      } else await openCoreLogsDirectory();
     } catch (error) {
       loggingFeedback.showNotice({ key: 'config.diagnostics.error.openLogs', variables: { error: String(error) } }, 'error');
     } finally {
@@ -895,14 +1038,14 @@ export function ConfigPanelPage() {
     }
   };
 
-  const saveTlsSettings = async () => {
+  const saveTlsSettings = async (): Promise<boolean> => {
     tlsFeedback.clearNotice();
-    if (tlsSettings === null || busyAction !== null) return;
+    if (tlsSettings === null || busyAction !== null) return false;
     const cert = tlsCertDraft.trim();
     const key = tlsKeyDraft.trim();
     if (tlsEnabledDraft && (!cert || !key)) {
       setTlsError(t('config.tls.error.pathsRequired'));
-      return;
+      return false;
     }
 
     setBusyAction('tls');
@@ -910,13 +1053,14 @@ export function ConfigPanelPage() {
     setTlsSavedStatusVisible(false);
     try {
       const result = await saveCoreTlsSettings({
+        expected: tlsSettings,
         settings: { enabled: tlsEnabledDraft, cert, key },
       });
       setTlsSettings(result);
       setTlsEnabledDraft(result.enabled);
       setTlsCertDraft(result.cert);
       setTlsKeyDraft(result.key);
-      if (coreStatus?.running) {
+      if (!selectedRemoteEndpoint() && coreStatus?.running) {
         const status = await restartCoreProcess();
         publishStatus(status);
         tlsFeedback.showNotice({ key: 'config.tls.notice.savedAndRestarted' }, 'success');
@@ -924,17 +1068,19 @@ export function ConfigPanelPage() {
         tlsFeedback.showNotice({ key: 'config.tls.notice.saved' }, 'success');
       }
       setTlsSavedStatusVisible(true);
+      return true;
     } catch (error) {
       setTlsError(String(error));
       void refreshStatus();
       void loadTlsSettings('preserve');
+      return false;
     } finally {
       setBusyAction(null);
     }
   };
 
   const selectTlsFile = async (target: 'cert' | 'key') => {
-    if (tlsSettings === null || busyAction !== null || tlsFileSelecting !== null) return;
+    if (selectedRemoteEndpoint() || tlsSettings === null || busyAction !== null || tlsFileSelecting !== null) return;
     setTlsFileSelecting(target);
     setTlsError('');
     try {
@@ -967,52 +1113,41 @@ export function ConfigPanelPage() {
     }
     await runMutation(
       'routing',
-      () => setCoreRoutingStrategy({ strategy }),
+      () => setCoreRoutingStrategy({ strategy, expected: { routingStrategy: settings?.routingStrategy } }),
       t('config.notice.routingUpdated'),
     );
   };
 
-  const saveNetworkEndpointSettings = async () => {
+  const saveNetworkEndpointSettings = async (): Promise<boolean> => {
     networkFeedback.clearNotice();
-    if (!settings || busyAction !== null) return;
+    if (!settings || busyAction !== null) return false;
     const host = hostDraft.trim();
     const port = Number(portDraft);
-    const proxyUrl = proxyUrlDraft.trim();
     setHostError('');
     setPortError('');
-    setProxyUrlError('');
     if (!host) {
       setHostError(t('config.error.hostRequired'));
       networkFeedback.showNotice({ key: 'config.error.hostRequired' }, 'error');
-      return;
+      return false;
     }
     if (!isValidPort(port)) {
       setPortError(t('config.error.portRange'));
       networkFeedback.showNotice({ key: 'config.error.portRange' }, 'error');
-      return;
+      return false;
     }
-    if (proxyOverrideDraft && proxyUrl && !/^(https?|socks|socks5h?):\/\//i.test(proxyUrl)) {
-      setProxyUrlError(t('config.error.proxyUrlScheme'));
-      networkFeedback.showNotice({ key: 'config.error.proxyUrlScheme' }, 'error');
-      return;
-    }
-
     const networkChanged = port !== settings.port || host !== settings.host;
     setBusyAction('network');
     try {
       const result = await saveNetworkEndpointSettingsCommand({
-        settings: networkDraftDirtyRef.current.proxyUrl || networkDraftDirtyRef.current.proxyOverride
-          ? { host, port, proxyUrl, proxyOverride: proxyOverrideDraft }
-          : { host, port },
+        expected: settings,
+        settings: { host, port },
       });
       clearDraftDirty('host');
       clearDraftDirty('port');
-      clearDraftDirty('proxyUrl');
-      clearDraftDirty('proxyOverride');
       applySettings(result, 'preserve');
       setLoadError('');
 
-      if (networkChanged && coreStatus?.running) {
+      if (networkChanged && !selectedRemoteEndpoint() && coreStatus?.running) {
         try {
           const status = await restartCoreProcess();
           publishStatus(status);
@@ -1026,17 +1161,19 @@ export function ConfigPanelPage() {
       } else {
         networkFeedback.showNotice({ key: 'config.notice.networkUpdated' }, 'success');
       }
+      return true;
     } catch (error) {
       networkFeedback.showNotice({ key: 'config.error.saveFailed', variables: { error: String(error) } }, 'error');
       void loadSettings('preserve');
+      return false;
     } finally {
       setBusyAction(null);
     }
   };
 
-  const saveRetrySettings = async () => {
+  const saveRetrySettings = async (): Promise<boolean> => {
     retryFeedback.clearNotice();
-    if (!settings || busyAction !== null) return;
+    if (!settings || busyAction !== null) return false;
     const retryDrafts = [
       requestRetryDraft,
       maxRetryCredentialsDraft,
@@ -1050,13 +1187,14 @@ export function ConfigPanelPage() {
     ) {
       setRetryError(templateText(templateMessages.retryRange, locale));
       retryFeedback.showNotice(templateText(templateMessages.retryRange, locale), 'error');
-      return;
+      return false;
     }
     const [requestRetry, maxRetryCredentials, maxRetryInterval, streamingBootstrapRetries] = retryValues;
     setRetryError('');
     setBusyAction('retry');
     try {
       const result = await saveRetrySettingsCommand({
+        expected: settings,
         settings: {
           disableCooling: disableCoolingDraft,
           requestRetry,
@@ -1073,27 +1211,30 @@ export function ConfigPanelPage() {
       applySettings(result, 'preserve');
       setLoadError('');
       retryFeedback.showNotice({ key: 'config.notice.retryUpdated' }, 'success');
+      return true;
     } catch (error) {
       retryFeedback.showNotice({ key: 'config.error.saveFailed', variables: { error: String(error) } }, 'error');
       void loadSettings('preserve');
+      return false;
     } finally {
       setBusyAction(null);
     }
   };
 
-  const saveSessionRoutingSettings = async () => {
+  const saveSessionRoutingSettings = async (): Promise<boolean> => {
     routingFeedback.clearNotice();
-    if (!settings || busyAction !== null) return;
+    if (!settings || busyAction !== null) return false;
     const routingSessionAffinityTtl = sessionTtlDraft.trim();
     if (routingSessionAffinityTtl && !SESSION_TTL_PATTERN.test(routingSessionAffinityTtl)) {
       setSessionTtlError(t('config.error.sessionTtlFormat'));
       routingFeedback.showNotice({ key: 'config.error.sessionTtlFormat' }, 'error');
-      return;
+      return false;
     }
     setSessionTtlError('');
     setBusyAction('routing');
     try {
       const result = await saveSessionRoutingSettingsCommand({
+        expected: settings,
         settings: {
           routingSessionAffinity: sessionAffinityDraft,
           routingSessionAffinityTtl,
@@ -1104,65 +1245,101 @@ export function ConfigPanelPage() {
       applySettings(result, 'preserve');
       setLoadError('');
       routingFeedback.showNotice({ key: 'config.notice.sessionRoutingUpdated' }, 'success');
+      return true;
     } catch (error) {
       routingFeedback.showNotice({ key: 'config.error.saveFailed', variables: { error: String(error) } }, 'error');
       void loadSettings('preserve');
+      return false;
     } finally {
       setBusyAction(null);
     }
   };
 
-  const saveSoftwareSettings = async () => {
-    softwareFeedback.clearNotice();
-    if (!softwareSettings || busyAction !== null) return;
-    if (
-      softwareCloseBehaviorDraft === softwareSettings.closeBehavior
-      && softwareAutostartDraft === softwareSettings.autostartEnabled
-      && softwareStartCoreDraft === softwareSettings.startCoreOnLaunch
-      && softwareSilentStartDraft === softwareSettings.silentStartEnabled
-      && softwareDefaultTerminalDraft === softwareSettings.defaultTerminal
-    ) return;
-
-    setBusyAction('software');
+  const flushSoftwarePreferences = async () => {
+    if (softwareSaveInFlightRef.current) return;
+    softwareSaveInFlightRef.current = true;
+    setSoftwareSaving(true);
+    let savedAny = false;
     try {
-      const result = await saveSoftwareSettingsCommand({
-        settings: {
-          closeBehavior: softwareCloseBehaviorDraft,
-          autostartEnabled: softwareAutostartDraft,
-          startCoreOnLaunch: softwareStartCoreDraft,
-          silentStartEnabled: softwareSilentStartDraft,
-          defaultTerminal: softwareDefaultTerminalDraft,
-        },
-      });
-      setSoftwareSettings(result);
-      setSoftwareCloseBehaviorDraft(result.closeBehavior);
-      setSoftwareAutostartDraft(result.autostartEnabled);
-      setSoftwareStartCoreDraft(result.startCoreOnLaunch);
-      setSoftwareSilentStartDraft(result.silentStartEnabled);
-      setSoftwareDefaultTerminalDraft(result.defaultTerminal);
+      while (softwareDesiredRef.current) {
+        const target = softwareDesiredRef.current;
+        const persisted = softwarePersistedRef.current;
+        if (persisted && sameSoftwarePreferences(target, pickSoftwarePreferences(persisted))) {
+          break;
+        }
+        const result = await saveSoftwareSettingsCommand({ settings: target });
+        softwarePersistedRef.current = result;
+        savedAny = true;
+        if (!mountedRef.current) return;
+        setSoftwareSettings(result);
+        if (softwareDesiredRef.current === target) {
+          const confirmed = pickSoftwarePreferences(result);
+          softwareDesiredRef.current = confirmed;
+          setSoftwareValues(confirmed);
+          break;
+        }
+      }
+      if (!mountedRef.current || !savedAny) return;
       setSoftwareSavedStatusVisible(true);
+      if (softwareSavedTimerRef.current !== null) {
+        window.clearTimeout(softwareSavedTimerRef.current);
+      }
+      softwareSavedTimerRef.current = window.setTimeout(() => {
+        if (mountedRef.current) setSoftwareSavedStatusVisible(false);
+        softwareSavedTimerRef.current = null;
+      }, 2400);
     } catch (error) {
+      if (!mountedRef.current) return;
       setSoftwareSavedStatusVisible(false);
+      const seqAtFailure = softwareMutationSeqRef.current;
+      if (softwarePersistedRef.current) {
+        const rollback = pickSoftwarePreferences(softwarePersistedRef.current);
+        softwareDesiredRef.current = rollback;
+        setSoftwareValues(rollback);
+      }
       softwareFeedback.showNotice({ key: 'config.error.saveFailed', variables: { error: String(error) } }, 'error');
-      void loadSoftwareSettings('preserve');
+      void getSoftwareSettings()
+        .then((latest) => {
+          if (!mountedRef.current || softwareSaveInFlightRef.current || softwareMutationSeqRef.current !== seqAtFailure) return;
+          softwarePersistedRef.current = latest;
+          const synced = pickSoftwarePreferences(latest);
+          softwareDesiredRef.current = synced;
+          setSoftwareSettings(latest);
+          setSoftwareValues(synced);
+        })
+        .catch(() => {});
     } finally {
-      setBusyAction(null);
+      softwareSaveInFlightRef.current = false;
+      if (mountedRef.current) setSoftwareSaving(false);
     }
+  };
+
+  const updateSoftwarePreference = (patch: Partial<SoftwarePreferenceValues>) => {
+    const persisted = softwarePersistedRef.current;
+    if (!persisted) return;
+    const base = softwareDesiredRef.current ?? pickSoftwarePreferences(persisted);
+    const next: SoftwarePreferenceValues = { ...base, ...patch };
+    if (sameSoftwarePreferences(base, next)) return;
+    softwareMutationSeqRef.current += 1;
+    softwareDesiredRef.current = next;
+    setSoftwareValues(next);
+    softwareFeedback.clearNotice();
+    if (softwareSavedTimerRef.current !== null) {
+      window.clearTimeout(softwareSavedTimerRef.current);
+      softwareSavedTimerRef.current = null;
+    }
+    setSoftwareSavedStatusVisible(false);
+    void flushSoftwarePreferences();
   };
 
   const discardNetworkEndpointDraft = () => {
     if (!settings) return;
     setPortDraft(String(settings.port));
     setHostDraft(settings.host);
-    setProxyUrlDraft(settings.proxyUrl);
-    setProxyOverrideDraft(settings.proxyOverride);
     clearDraftDirty('port');
     clearDraftDirty('host');
-    clearDraftDirty('proxyUrl');
-    clearDraftDirty('proxyOverride');
     setPortError('');
     setHostError('');
-    setProxyUrlError('');
   };
 
   const discardTlsDraft = () => {
@@ -1174,7 +1351,9 @@ export function ConfigPanelPage() {
   };
 
   const discardProxyDraft = () => {
-    setProxyDraft(proxyState?.config ?? DEFAULT_REVERSE_PROXY_DRAFT);
+    const restored = proxyState?.config ?? DEFAULT_REVERSE_PROXY_DRAFT;
+    setProxyDraft(restored);
+    syncProxyPortInputs(restored);
     setProxyDirty(false);
     setProxyFieldErrors({});
   };
@@ -1216,15 +1395,6 @@ export function ConfigPanelPage() {
     setLoggingError('');
   };
 
-  const discardSoftwareDraft = () => {
-    if (!softwareSettings) return;
-    setSoftwareCloseBehaviorDraft(softwareSettings.closeBehavior);
-    setSoftwareAutostartDraft(softwareSettings.autostartEnabled);
-    setSoftwareStartCoreDraft(softwareSettings.startCoreOnLaunch);
-    setSoftwareSilentStartDraft(softwareSettings.silentStartEnabled);
-    setSoftwareDefaultTerminalDraft(softwareSettings.defaultTerminal);
-  };
-
   const coreUnavailable = loading || settings === null;
   const nativeSectionsPending = loading || loadError !== '';
   const renderNativeSkeleton = () => (
@@ -1240,8 +1410,6 @@ export function ConfigPanelPage() {
   const networkSettingsDirty = Boolean(settings) && (
     hostDraft.trim() !== settings?.host
     || portDraft !== String(settings?.port)
-    || proxyUrlDraft.trim() !== settings?.proxyUrl
-    || proxyOverrideDraft !== settings?.proxyOverride
   );
   const sessionRoutingDirty = Boolean(settings) && (
     sessionAffinityDraft !== settings?.routingSessionAffinity
@@ -1263,40 +1431,12 @@ export function ConfigPanelPage() {
     || usageStatisticsDraft !== settings?.usageStatisticsEnabled
     || redisUsageRetentionDraft !== String(settings?.redisUsageQueueRetentionSeconds)
   );
-  const softwareCloseBehaviorDirty = softwareSettings !== null
-    && softwareCloseBehaviorDraft !== softwareSettings.closeBehavior;
-  const softwareAutostartDirty = softwareSettings !== null
-    && softwareAutostartDraft !== softwareSettings.autostartEnabled;
-  const softwareSilentStartDirty = softwareSettings !== null
-    && softwareSilentStartDraft !== softwareSettings.silentStartEnabled;
-  const softwareStartCoreDirty = softwareSettings !== null
-    && softwareStartCoreDraft !== softwareSettings.startCoreOnLaunch;
-  const softwareDefaultTerminalDirty = softwareSettings !== null
-    && softwareDefaultTerminalDraft !== softwareSettings.defaultTerminal;
-  const softwareSettingsDirty = softwareCloseBehaviorDirty
-    || softwareAutostartDirty
-    || softwareStartCoreDirty
-    || softwareSilentStartDirty
-    || softwareDefaultTerminalDirty;
-  const softwareStatusLabel = softwareSettingsLoading
-    ? t('common.loading')
-    : softwareSettings === null
-      ? t('common.unavailable')
-      : softwareSettingsDirty
-        ? t('config.network.unsaved')
-        : softwareSavedStatusVisible
-          ? t('config.network.saved')
-          : '';
-  const softwareStatusIsSaved = !softwareSettingsLoading
-    && softwareSettings !== null
-    && !softwareSettingsDirty
-    && softwareSavedStatusVisible;
   const tlsSettingsDirty = tlsSettings !== null && (
     tlsEnabledDraft !== tlsSettings.enabled
     || tlsCertDraft.trim() !== tlsSettings.cert
     || tlsKeyDraft.trim() !== tlsSettings.key
   );
-  otherDraftDirtyRef.current = { software: softwareSettingsDirty, tls: tlsSettingsDirty };
+  otherDraftDirtyRef.current = { tls: tlsSettingsDirty };
   const tlsStatusLabel = tlsSettingsLoading
     ? t('common.loading')
     : tlsSettings === null
@@ -1323,8 +1463,8 @@ export function ConfigPanelPage() {
   const retryControlsDisabled = coreUnavailable || busyAction === 'retry';
   const diagnosticsControlsDisabled = coreUnavailable || busyAction === 'logging' || busyAction === 'open-logs';
   const tlsControlsDisabled = tlsSettingsLoading || tlsSettings === null || busyAction === 'tls';
-  const softwareControlsDisabled = softwareSettingsLoading || softwareSettings === null || busyAction === 'software';
-  const proxyControlsDisabled = coreUnavailable || proxyInitialLoading || proxyAction !== null || proxyFileSelecting !== null;
+  const softwareControlsDisabled = softwareSettingsLoading || softwareSettings === null;
+  const proxyControlsDisabled = backendNotReady || proxyInitialLoading || proxyAction !== null || proxyFileSelecting !== null;
   const activateConfigSubpage = (subpage: ConfigSubpage) => {
     setSettingsSearch('');
     setActiveSubpage(subpage);
@@ -1341,15 +1481,18 @@ export function ConfigPanelPage() {
     const destination = takeRequestedSettingField();
     if (destination) navigateToSetting(destination);
   }, []);
+  const normalizedNetworkHost = hostDraft.trim().replace(/^\[|\]$/g, '').toLowerCase();
+  const allowLanDraft = normalizedNetworkHost === '0.0.0.0' || normalizedNetworkHost === '::';
   const nativeDirty = {
     keys: false, management: Boolean(managementSecretDraft || managementSecretConfirm),
     network: networkSettingsDirty, tls: tlsSettingsDirty, routing: sessionRoutingDirty,
-    retry: retrySettingsDirty, logging: loggingSettingsDirty, software: softwareSettingsDirty,
+    retry: retrySettingsDirty, logging: loggingSettingsDirty,
   };
   const nativeEntries: SettingSearchEntry[] = [
     { category: 'general', target: 'config-native-keys', title: t('config.keys.title'), context: '', keywords: 'API key token 鉴权密钥 api-keys access' },
     { category: 'general', target: 'config-native-management', title: t('config.webuiKey.title'), context: '', keywords: 'WebUI secret-key 密钥 管理接口 面板 密码 management security' },
-    { category: 'general', target: 'config-native-network', title: st('nativeNetwork'), context: '', keywords: [t('config.network.port'), t('config.network.listenHost'), t('config.network.proxyUrl'), t('config.network.systemProxy'), 'server host port proxy URL 8317 127.0.0.1 0.0.0.0 监听 地址 系统代理'].join(' ') },
+    { category: 'general', target: 'config-native-network', title: st('nativeNetwork'), context: '', keywords: [t('config.network.port'), t('config.network.listenHost'), t('kernel.control.allowLan'), 'server host port LAN 8317 127.0.0.1 0.0.0.0 允许局域网 局域网 监听 地址'].join(' ') },
+    ...(!external ? [{ category: 'general' as const, target: 'config-system-proxy', title: st('outboundProxyTitle'), context: t('config.network.systemProxy'), keywords: 'IP proxy HTTP SOCKS 代理 URL 系统代理' }] : []),
     { category: 'general', target: 'config-native-tls', title: t('config.tls.enable'), context: '', keywords: [t('config.tls.cert'), t('config.tls.key'), 'TLS HTTPS cert key certificate 证书 私钥 加密'].join(' ') },
     { category: 'proxy', target: 'config-native-reverse-proxy', title: st('reverseProxyTitle'), context: '', keywords: [st('reverseProxyListenHost'), st('reverseProxyListenPort'), st('reverseProxyTargetPort'), st('reverseProxyCertPath'), st('reverseProxyKeyPath'), 'reverse proxy 反向代理 HTTPS 转发 监听 端口'].join(' ') },
     { category: 'routing', target: 'config-native-routing', title: st('nativeRouting'), context: '', keywords: [t('config.network.sessionAffinity'), t('config.network.sessionTtl'), t('config.routing.title'), 'session affinity ttl routing strategy round-robin 会话 粘性 加权 轮询'].join(' ') },
@@ -1360,7 +1503,7 @@ export function ConfigPanelPage() {
     { category: 'sensitiveWords', target: 'config-native-sensitive-words', title: t('config.sensitiveWords.title'), context: t('config.sensitiveWords.replacements'), keywords: 'sensitive words replacements filters antigravity devin 敏感词 内容 过滤 替换' },
   ];
   const nativeCategoryDirty: Record<ConfigSubpage, boolean> = {
-    general: nativeDirty.management || networkSettingsDirty || tlsSettingsDirty,
+    general: nativeDirty.management || networkSettingsDirty || tlsSettingsDirty || outboundProxyDirty,
     proxy: proxyDirty,
     aliases: false,
     routing: sessionRoutingDirty || retrySettingsDirty,
@@ -1368,7 +1511,7 @@ export function ConfigPanelPage() {
     sensitiveWords: sensitiveWordsDirty,
     diagnostics: loggingSettingsDirty,
     oauth: false,
-    software: softwareSettingsDirty,
+    software: false,
   };
   const categoryDirty = (id: ConfigSubpage) => nativeCategoryDirty[id]
     || settingsTemplateGroups[id].some(group => dirtyTemplateGroups.includes(group.id));
@@ -1389,6 +1532,97 @@ export function ConfigPanelPage() {
     return searchTerms.every(term => text.includes(term));
   });
 
+  const softwareTabTitle = templateText(settingsCategories.find(item => item.id === 'software')!.title, locale);
+  const dirtyDescriptors: Array<{ key: string; category: ConfigSubpage; target: string; label: string }> = [
+    ...(nativeDirty.management ? [{ key: 'management', category: 'general' as const, target: 'config-native-management', label: t('config.webuiKey.title') }] : []),
+    ...(networkSettingsDirty ? [{ key: 'network', category: 'general' as const, target: 'config-native-network', label: st('nativeNetwork') }] : []),
+    ...(!external && outboundProxyDirty ? [{ key: 'outbound-proxy', category: 'general' as const, target: 'config-system-proxy', label: st('outboundProxyTitle') }] : []),
+    ...(tlsSettingsDirty ? [{ key: 'tls', category: 'general' as const, target: 'config-native-tls', label: t('config.tls.enable') }] : []),
+    ...(proxyDirty ? [{ key: 'proxy', category: 'proxy' as const, target: 'config-native-reverse-proxy', label: st('reverseProxyTitle') }] : []),
+    ...(sessionRoutingDirty ? [{ key: 'routing', category: 'routing' as const, target: 'config-native-routing', label: st('nativeRouting') }] : []),
+    ...(retrySettingsDirty ? [{ key: 'retry', category: 'routing' as const, target: 'config-native-retry', label: st('nativeRetry') }] : []),
+    ...(loggingSettingsDirty ? [{ key: 'logging', category: 'diagnostics' as const, target: 'config-native-logging', label: t('config.diagnostics.title') }] : []),
+    ...(sensitiveWordsDirty ? [{ key: 'sensitiveWords', category: 'sensitiveWords' as const, target: 'config-native-sensitive-words', label: t('config.sensitiveWords.title') }] : []),
+    ...dirtyTemplateGroups.flatMap((groupId) => {
+      const category = settingsCategories.find((item) => settingsTemplateGroups[item.id].some((group) => group.id === groupId));
+      const group = allSettingsTemplateGroups.find((item) => item.id === groupId);
+      if (!category || !group) return [];
+      return [{ key: `template-${groupId}`, category: category.id, target: `config-group-${groupId}`, label: templateText(group.title, locale) }];
+    }),
+  ];
+  const anySaveBusy = savingAll || busyAction !== null || proxyAction !== null;
+
+  const discardAllDirty = () => {
+    if (anySaveBusy) return;
+    if (nativeDirty.management) discardManagementSecretDraft();
+    if (networkSettingsDirty) discardNetworkEndpointDraft();
+    if (!external && outboundProxyDirty) updateOutboundProxy(null);
+    if (tlsSettingsDirty) discardTlsDraft();
+    if (proxyDirty) discardProxyDraft();
+    if (sessionRoutingDirty) discardSessionRoutingDraft();
+    if (retrySettingsDirty) discardRetryDraft();
+    if (loggingSettingsDirty) discardLoggingDraft();
+    if (dirtyTemplateGroups.length > 0) templateSectionRef.current?.discardAllDirtyGroups();
+    if (sensitiveWordsDirty) void sensitiveWordsRef.current?.discardImmediate();
+  };
+
+  const saveAllDirty = async () => {
+    if (anySaveBusy || dirtyDescriptors.length === 0) return;
+    setSavingAll(true);
+    try {
+      const steps: Array<{ category: ConfigSubpage; target: string; run: () => Promise<boolean> }> = [];
+      if (nativeDirty.management) steps.push({ category: 'general', target: 'config-native-management', run: performSaveManagementSecret });
+      if (networkSettingsDirty) steps.push({ category: 'general', target: 'config-native-network', run: saveNetworkEndpointSettings });
+      if (!external && outboundProxyDirty) steps.push({ category: 'general', target: 'config-system-proxy', run: performSaveOutboundProxy });
+      if (tlsSettingsDirty) steps.push({ category: 'general', target: 'config-native-tls', run: saveTlsSettings });
+      if (proxyDirty) steps.push({ category: 'proxy', target: 'config-native-reverse-proxy', run: handleProxySave });
+      if (sessionRoutingDirty) steps.push({ category: 'routing', target: 'config-native-routing', run: saveSessionRoutingSettings });
+      if (retrySettingsDirty) steps.push({ category: 'routing', target: 'config-native-retry', run: saveRetrySettings });
+      if (loggingSettingsDirty) steps.push({ category: 'diagnostics', target: 'config-native-logging', run: saveCoreLoggingSettings });
+      if (dirtyTemplateGroups.length > 0) {
+        const firstGroupId = dirtyTemplateGroups[0];
+        const firstCategory = settingsCategories.find((item) => settingsTemplateGroups[item.id].some((group) => group.id === firstGroupId))?.id ?? activeSubpage;
+        steps.push({
+          category: firstCategory,
+          target: `config-group-${firstGroupId}`,
+          run: async () => (await templateSectionRef.current?.saveAllDirtyGroups()) ?? true,
+        });
+      }
+      if (sensitiveWordsDirty) {
+        steps.push({
+          category: 'sensitiveWords',
+          target: 'config-native-sensitive-words',
+          run: async () => (await sensitiveWordsRef.current?.save()) ?? true,
+        });
+      }
+      for (const step of steps) {
+        const ok = await step.run();
+        if (!ok) {
+          navigateToSetting({ category: step.category, target: step.target });
+          break;
+        }
+      }
+    } finally {
+      setSavingAll(false);
+    }
+  };
+
+  const saveAllRef = useRef(saveAllDirty);
+  saveAllRef.current = saveAllDirty;
+  const hasDirtyRef = useRef(false);
+  hasDirtyRef.current = dirtyDescriptors.length > 0;
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === 's') {
+        if (!hasDirtyRef.current) return;
+        event.preventDefault();
+        void saveAllRef.current();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
   return (
     <section className="page config-page" aria-label={st('title')}>
       {confirmationDialog}
@@ -1397,11 +1631,9 @@ export function ConfigPanelPage() {
           <Tabs ref={categoryNavigationRef} className="config-subpage-tabs secondary-page-tabs" aria-label={t('config.tabs.label')} value={activeSubpage} onChange={activateConfigSubpage}
             items={settingsCategories.map(item => {
               const title = templateText(item.title, locale);
-              const dirty = categoryDirty(item.id);
               return {
                 value: item.id, id: `config-subpage-tab-${item.id}`, panelId: 'config-subpage-panel',
-                title: dirty ? `${title} · ${st('dirty')}` : undefined,
-                label: <><span>{title}</span>{dirty ? <><span className="config-nav-dirty" aria-hidden="true" /><span className="config-nav-dirty-text" aria-hidden="true">{st('dirty')}</span></> : null}</>,
+                label: title,
               };
             })} />
           <div className="config-settings-search search-control" data-size="default"><Search size={18} aria-hidden="true" /><input ref={searchRef} type="search" aria-label={st('search')} placeholder={st('searchHint')} value={settingsSearch} onChange={event => setSettingsSearch(event.currentTarget.value)} onKeyDown={event => { if (event.key === 'Escape') setSettingsSearch(''); }} />{searching ? <button type="button" className="icon-button quiet tiny-button" aria-label={st('clearSearch')} onClick={() => { setSettingsSearch(''); searchRef.current?.focus(); }}><X size={16} /></button> : <kbd className="config-settings-search-key" aria-hidden="true">/</kbd>}</div>
@@ -1451,8 +1683,12 @@ export function ConfigPanelPage() {
                 </div>
               ))
             ) : settings && settings.apiKeys.length > 0 ? (
-              settings.apiKeys.map((entry, index) => (
-                <div className="config-key-row" key={`${index}-${entry.apiKey}`}>
+              settings.apiKeys.map((entry, index) => {
+                const keyRowId = `${index}-${entry.apiKey}`;
+                const keyRevealed = Boolean(revealedKeyMap[keyRowId]);
+                const displayKey = keyRevealed ? entry.apiKey : maskApiKey(entry.apiKey);
+                return (
+                <div className="config-key-row" key={keyRowId}>
                   <div className="config-key-identity">
                     <span className="config-key-index">{String(index + 1).padStart(2, '0')}</span>
                     <div className="config-key-details">
@@ -1461,10 +1697,25 @@ export function ConfigPanelPage() {
                           {entry.remark || t('config.keys.noRemark')}
                         </strong>
                       </div>
-                      <code title={maskApiKey(entry.apiKey)}>{maskApiKey(entry.apiKey)}</code>
+                      <code className={keyRevealed ? 'is-revealed' : ''} title={displayKey}>{displayKey}</code>
                     </div>
                   </div>
                   <div className="config-key-actions">
+                    <button
+                      type="button"
+                      className={`icon-button quiet small-button${keyRevealed ? ' is-revealed' : ''}`}
+                      onClick={() => setRevealedKeyMap(prev => ({ ...prev, [keyRowId]: !prev[keyRowId] }))}
+                      disabled={keysDisabled}
+                      aria-pressed={keyRevealed}
+                      title={keyRevealed ? t('config.keys.hide') : t('config.keys.show')}
+                      aria-label={keyRevealed ? t('config.keys.hide') : t('config.keys.show')}
+                    >
+                      {keyRevealed ? (
+                        <Eye size={15} strokeWidth={1.75} aria-hidden="true" />
+                      ) : (
+                        <EyeOff size={15} strokeWidth={1.75} aria-hidden="true" />
+                      )}
+                    </button>
                     <button
                       type="button"
                       className="icon-button quiet small-button"
@@ -1474,9 +1725,9 @@ export function ConfigPanelPage() {
                       aria-label={copiedIndex === index ? t('config.notice.keyCopied') : t('config.keys.copyNth', { number: index + 1 })}
                     >
                       {copiedIndex === index ? (
-                        <Check size={16} aria-hidden="true" />
+                        <Check size={15} aria-hidden="true" />
                       ) : (
-                        <Copy size={16} aria-hidden="true" />
+                        <Copy size={15} aria-hidden="true" />
                       )}
                     </button>
                     <button
@@ -1487,7 +1738,7 @@ export function ConfigPanelPage() {
                       title={t('config.keys.edit')}
                       aria-label={t('config.keys.editNth', { number: index + 1 })}
                     >
-                      <Pencil size={16} aria-hidden="true" />
+                      <Pencil size={15} aria-hidden="true" />
                     </button>
                     <button
                       type="button"
@@ -1497,16 +1748,17 @@ export function ConfigPanelPage() {
                       title={t('config.keys.delete')}
                       aria-label={t('config.keys.deleteNth', { number: index + 1 })}
                     >
-                      <Trash2 size={16} aria-hidden="true" />
+                      <Trash2 size={15} aria-hidden="true" />
                     </button>
                   </div>
                 </div>
-              ))
+                );
+              })
             ) : (
               <EmptyState className="config-empty-list" icon={<KeyRound size={26} />} title={t('config.keys.empty')} />
             )}
           </div>
-          {!addDialogOpen && deleteIndex === null ? renderFeedback(keyFeedback) : null}
+          {!addDialogOpen && deleteIndex === null ? renderFeedback(keyFeedback, !searching && activeSubpage === 'general') : null}
         </section>
 <section id="config-native-management" tabIndex={-1} hidden={searching || activeSubpage !== 'general'} className="panel surface-card config-management-panel">
           <div className="config-panel-heading">
@@ -1535,10 +1787,11 @@ export function ConfigPanelPage() {
               className="config-management-form"
               onSubmit={(event) => void saveManagementSecret(event)}
             >
-              <label className="config-management-field">
-                <span>{t('config.webuiKey.newKey')}</span>
+              <div className="config-management-field">
+                <label htmlFor="config-webui-new-key">{t('config.webuiKey.newKey')}</label>
                 <div className="config-secret-input">
                   <input
+                    id="config-webui-new-key"
                     type={showManagementSecret ? 'text' : 'password'}
                     autoComplete="new-password"
                     maxLength={512}
@@ -1553,38 +1806,57 @@ export function ConfigPanelPage() {
                   />
                   <button
                     type="button"
-                    className="icon-button quiet"
+                    className={`icon-button quiet config-secret-toggle${showManagementSecret ? ' is-revealed' : ''}`}
                     disabled={managementControlsDisabled}
+                    aria-pressed={showManagementSecret}
                     onClick={() => setShowManagementSecret((value) => !value)}
                     title={showManagementSecret ? t('config.keys.hide') : t('config.keys.show')}
                     aria-label={showManagementSecret ? t('config.keys.hide') : t('config.keys.show')}
                   >
                     {showManagementSecret ? (
-                      <EyeOff size={16} aria-hidden="true" />
+                      <Eye size={16} strokeWidth={1.75} aria-hidden="true" />
                     ) : (
-                      <Eye size={16} aria-hidden="true" />
+                      <EyeOff size={16} strokeWidth={1.75} aria-hidden="true" />
                     )}
                   </button>
                 </div>
-              </label>
+              </div>
 
-              <label className="config-management-field">
-                <span>{t('config.webuiKey.confirmKey')}</span>
-                <input
-                  className="config-dialog-text-input"
-                  type={showManagementSecret ? 'text' : 'password'}
-                  autoComplete="new-password"
-                  maxLength={512}
-                  value={managementSecretConfirm}
-                  disabled={managementControlsDisabled}
-                  aria-invalid={Boolean(managementSecretError)}
-                  placeholder={t('config.webuiKey.confirmPlaceholder')}
-                  onChange={(event) => {
-                    setManagementSecretConfirm(event.currentTarget.value);
-                    setManagementSecretError('');
-                  }}
-                />
-              </label>
+              <div className="config-management-field">
+                <label htmlFor="config-webui-confirm-key">{t('config.webuiKey.confirmKey')}</label>
+                <div className="config-secret-input">
+                  <input
+                    id="config-webui-confirm-key"
+                    className="config-dialog-text-input"
+                    type={showManagementSecret ? 'text' : 'password'}
+                    autoComplete="new-password"
+                    maxLength={512}
+                    value={managementSecretConfirm}
+                    disabled={managementControlsDisabled}
+                    aria-invalid={Boolean(managementSecretError)}
+                    placeholder={t('config.webuiKey.confirmPlaceholder')}
+                    onChange={(event) => {
+                      setManagementSecretConfirm(event.currentTarget.value);
+                      setManagementSecretError('');
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className={`icon-button quiet config-secret-toggle${showManagementSecret ? ' is-revealed' : ''}`}
+                    disabled={managementControlsDisabled}
+                    aria-pressed={showManagementSecret}
+                    onClick={() => setShowManagementSecret((value) => !value)}
+                    title={showManagementSecret ? t('config.keys.hide') : t('config.keys.show')}
+                    aria-label={showManagementSecret ? t('config.keys.hide') : t('config.keys.show')}
+                  >
+                    {showManagementSecret ? (
+                      <Eye size={16} strokeWidth={1.75} aria-hidden="true" />
+                    ) : (
+                      <EyeOff size={16} strokeWidth={1.75} aria-hidden="true" />
+                    )}
+                  </button>
+                </div>
+              </div>
 
               <div className="config-management-form-footer">
                 <span
@@ -1600,23 +1872,35 @@ export function ConfigPanelPage() {
                   <button
                     type="button"
                     className="secondary-button compact-button"
-                  disabled={managementControlsDisabled}
-                  onClick={generateManagementSecret}
-                >
+                    disabled={managementControlsDisabled}
+                    onClick={generateManagementSecret}
+                  >
                     {t('config.webuiKey.generate')}
                   </button>
-                  <button
-                    type="submit"
-                    className="primary-button compact-button"
-                    disabled={managementControlsDisabled || !managementSecretDraft.trim()}
-                  >
-                    <Check size={16} aria-hidden="true" />
-                    {managementSecretBusy ? t('common.saving') : t('config.webuiKey.save')}
-                  </button>
+                  {nativeDirty.management ? (
+                    <>
+                      <button
+                        type="button"
+                        className="secondary-button compact-button"
+                        disabled={managementControlsDisabled}
+                        onClick={discardManagementSecretDraft}
+                      >
+                        {t('agents.catalog.discard')}
+                      </button>
+                      <button
+                        type="submit"
+                        className="primary-button compact-button"
+                        disabled={managementControlsDisabled || !managementSecretDraft.trim()}
+                      >
+                        <Check size={16} aria-hidden="true" />
+                        {managementSecretBusy ? t('common.saving') : t('config.webuiKey.save')}
+                      </button>
+                    </>
+                  ) : null}
                 </div>
               </div>
             </form>
-            {renderFeedback(managementFeedback)}
+            {renderFeedback(managementFeedback, !searching && activeSubpage === 'general')}
           </div>
         </section>
 <section id="config-native-network" tabIndex={-1} hidden={searching || activeSubpage !== 'general'}
@@ -1628,36 +1912,28 @@ export function ConfigPanelPage() {
                 <Network size={16} aria-hidden="true" />
                 <h3 id="config-network-section-title">{st('nativeNetwork')}</h3>
               </div>
-              <span className="config-card-status" role="status">{busyAction === 'network' ? <span className="state-pill">{t('common.saving')}</span> : nativeDirty.network ? st('dirty') : ''}</span>
-
+              <div className="config-heading-actions">
+                {busyAction === 'network' ? (
+                  <span className="state-pill">{t('common.saving')}</span>
+                ) : null}
+                <label className="config-proxy-system-toggle" title={t('kernel.control.lanRestartHint')}>
+                  <span>{t('kernel.control.allowLan')}</span>
+                  <Switch
+                    aria-label={t('kernel.control.allowLanAria')}
+                    checked={allowLanDraft}
+                    disabled={networkControlsDisabled}
+                    onChange={(event) => {
+                      markDraftDirty('host');
+                      setHostDraft(event.currentTarget.checked ? '0.0.0.0' : '127.0.0.1');
+                      setHostError('');
+                    }}
+                  />
+                </label>
+              </div>
             </div>
-            {renderFeedback(networkFeedback)}
+            {renderFeedback(networkFeedback, !searching && activeSubpage === 'general')}
             {nativeSectionsPending ? renderNativeSkeleton() : (<>
             <div className="config-network-grid">
-              <div className="config-network-field config-network-port-field">
-            <span className="config-field-label"><label htmlFor="config-input-config-network-port">{t('config.network.port')}</label><SettingsHelp label={t('config.network.port')}>{t('config.network.portHint')}</SettingsHelp></span>
-            <input
-                  id="config-input-config-network-port"
-              className={`config-network-input ${portError ? 'error' : ''}`}
-              type="text"
-              inputMode="numeric"
-              pattern="[0-9]*"
-              maxLength={5}
-              value={portDraft}
-              disabled={networkControlsDisabled}
-              aria-invalid={Boolean(portError)}
-              aria-describedby={portError ? 'config-network-port-error' : undefined}
-              title={portError || t('config.network.portHint')}
-              onChange={(event) => {
-                markDraftDirty('port');
-                setPortDraft(event.currentTarget.value.replace(/\D/g, '').slice(0, 5));
-                setPortError('');
-              }}
-            />
-            <span id="config-network-port-error" className="config-field-error" role="alert">{portError || ' '}</span>
-
-              </div>
-
               <div className="config-network-field">
                 <span className="config-field-label"><label htmlFor="config-input-config-network-listenHost">{t('config.network.listenHost')}</label><SettingsHelp label={t('config.network.listenHost')}>{templateText(templateMessages.hostHint, locale)}</SettingsHelp></span>
                 <input
@@ -1676,66 +1952,116 @@ export function ConfigPanelPage() {
                     setHostError('');
                   }}
                 />
-                <span id="config-network-host-error" className="config-field-error" role="alert">{hostError || ' '}</span>
-
+                <span id="config-network-host-error" className="config-field-error" role="alert">{hostError}</span>
               </div>
 
-              <div className="config-network-field config-proxy-field">
-                <div className="config-proxy-heading">
-                  <label className="config-network-label" htmlFor="config-network-proxy-url">
-                    <Link2 size={15} aria-hidden="true" />
-                    {t('config.network.proxyUrl')}
-                  </label>
-                  <SettingsHelp label={t('config.network.proxyUrl')}>{t('config.network.proxyHint')} {t('config.network.systemProxyHint')}</SettingsHelp>
-                  <label className="config-proxy-system-toggle" title={t('config.network.systemProxyHint')}>
-                    <span>{t('config.network.systemProxy')}</span>
-                    <Switch checked={!proxyOverrideDraft} disabled={networkControlsDisabled} onChange={(event) => {
-                          markDraftDirty('proxyOverride');
-                          setProxyOverrideDraft(!event.currentTarget.checked);
-                        }} />
-                  </label>
-                </div>
+              <div className="config-network-field config-network-port-field">
+                <span className="config-field-label"><label htmlFor="config-input-config-network-port">{t('config.network.port')}</label><SettingsHelp label={t('config.network.port')}>{t('config.network.portHint')}</SettingsHelp></span>
                 <input
-                  id="config-network-proxy-url"
-                  className={`config-network-input ${proxyUrlError ? 'error' : ''}`}
+                  id="config-input-config-network-port"
+                  className={`config-network-input ${portError ? 'error' : ''}`}
                   type="text"
-                  value={proxyUrlDraft}
-                  disabled={networkControlsDisabled || !proxyOverrideDraft}
-                  placeholder={t('config.network.proxyPlaceholder')}
-                  aria-invalid={Boolean(proxyUrlError)}
-                  aria-describedby={proxyUrlError ? 'config-network-proxy-url-error' : undefined}
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  maxLength={5}
+                  value={portDraft}
+                  disabled={networkControlsDisabled}
+                  aria-invalid={Boolean(portError)}
+                  aria-describedby={portError ? 'config-network-port-error' : undefined}
+                  title={portError || t('config.network.portHint')}
                   onChange={(event) => {
-                    markDraftDirty('proxyUrl');
-                    setProxyUrlDraft(event.currentTarget.value);
-                    setProxyUrlError('');
+                    markDraftDirty('port');
+                    setPortDraft(event.currentTarget.value.replace(/\D/g, '').slice(0, 5));
+                    setPortError('');
                   }}
                 />
-                <span id="config-network-proxy-url-error" className="config-field-error" role="alert">{proxyUrlError || ' '}</span>
-
+                <span id="config-network-port-error" className="config-field-error" role="alert">{portError}</span>
               </div>
             </div>
 
-          {settings && (hostDraft.trim() !== settings.host || portDraft !== String(settings.port)) ? (
-            <Notice tone="warn" icon={<AlertCircle size={16} />}>{st('restart')}</Notice>
-          ) : null}
-
-          <div className="config-settings-save-row"><button
-                type="button"
-                className="secondary-button compact-button"
-                disabled={networkControlsDisabled || !networkSettingsDirty}
-                onClick={discardNetworkEndpointDraft}
-              >
-                {t('agents.catalog.discard')}
-              </button><button
-                type="button"
-                className="primary-button compact-button"
-                disabled={networkControlsDisabled || !networkSettingsDirty}
-                onClick={() => void saveNetworkEndpointSettings()}
-              >
-                <Check size={16} aria-hidden="true" />
-                {busyAction === 'network' ? t('common.saving') : t('common.save')}
-              </button></div></>)}
+          {networkSettingsDirty ? (
+            <div className="config-card-dirty-footer">
+              <span className="config-card-dirty-hint">
+                <AlertCircle size={14} aria-hidden="true" />
+                <span>{st(external ? 'externalRestart' : 'restart')}</span>
+              </span>
+              <div className="config-inline-dirty-actions">
+                <button
+                  type="button"
+                  className="secondary-button compact-button"
+                  disabled={networkControlsDisabled}
+                  onClick={discardNetworkEndpointDraft}
+                >
+                  {t('agents.catalog.discard')}
+                </button>
+                <button
+                  type="button"
+                  className="primary-button compact-button"
+                  disabled={networkControlsDisabled}
+                  onClick={() => void saveNetworkEndpointSettings()}
+                >
+                  <Check size={15} aria-hidden="true" />
+                  {busyAction === 'network' ? t('common.saving') : t('common.save')}
+                </button>
+              </div>
+            </div>
+          ) : null}</>)}
         </section>
+        {!external && <section id="config-system-proxy" tabIndex={-1} hidden={searching || activeSubpage !== 'general'} className="panel surface-card config-outbound-proxy-section" aria-labelledby="config-outbound-proxy-title">
+          <form className="config-outbound-proxy-form" onSubmit={saveOutboundProxy}>
+            <div className="config-panel-heading">
+              <div className="config-heading-title">
+                <Link2 size={16} aria-hidden="true" />
+                <h2 id="config-outbound-proxy-title">{st('outboundProxyTitle')}</h2>
+              </div>
+              <div className="config-heading-actions">
+                {busyAction === 'outbound-proxy' ? (
+                  <span className="state-pill">{t('common.saving')}</span>
+                ) : null}
+                <label className="config-proxy-system-toggle" title={t('config.network.systemProxyHint')}>
+                  <span>{t('config.network.systemProxy')}</span>
+                  <Switch checked={!outboundProxy.proxyOverride} disabled={outboundProxyDisabled} onChange={event =>
+                    updateOutboundProxy({ proxyUrl: outboundProxy.proxyUrl, proxyOverride: !event.currentTarget.checked })
+                  } />
+                </label>
+              </div>
+            </div>
+            <div className="config-network-field config-proxy-field">
+              <span className="config-field-label">
+                <label htmlFor="config-network-proxy-url">{t('config.network.proxyUrl')}</label>
+                <SettingsHelp label={t('config.network.proxyUrl')}>{t('config.network.proxyHint')}</SettingsHelp>
+              </span>
+              <input
+                id="config-network-proxy-url"
+                className={`config-network-input ${outboundProxyError ? 'error' : ''}`}
+                type="text"
+                spellCheck={false}
+                autoComplete="off"
+                value={outboundProxy.proxyOverride ? outboundProxy.proxyUrl : detectedProxyUrl}
+                disabled={outboundProxyDisabled || !outboundProxy.proxyOverride}
+                placeholder={outboundProxy.proxyOverride ? t('config.network.proxyPlaceholder') : t('config.network.systemProxy')}
+                aria-invalid={outboundProxyError}
+                aria-describedby={outboundProxyError ? 'config-network-proxy-url-error' : undefined}
+                onChange={event => updateOutboundProxy({ proxyOverride: true, proxyUrl: event.currentTarget.value })}
+              />
+              {outboundProxyError && <span id="config-network-proxy-url-error" className="config-field-error" role="alert">{t('config.error.proxyUrlScheme')}</span>}
+            </div>
+            {outboundProxyDirty ? (
+              <div className="config-card-dirty-footer">
+                <div className="config-inline-dirty-actions">
+                  <button type="button" className="secondary-button compact-button" disabled={outboundProxyDisabled} onClick={() => updateOutboundProxy(null)}>
+                    {t('agents.catalog.discard')}
+                  </button>
+                  <button type="submit" className="primary-button compact-button" disabled={outboundProxyDisabled}>
+                    <Check size={15} aria-hidden="true" />
+                    {busyAction === 'outbound-proxy' ? t('common.saving') : t('common.save')}
+                  </button>
+                </div>
+              </div>
+            ) : null}
+          </form>
+          {renderFeedback(outboundProxyFeedback, !searching && activeSubpage === 'general')}
+        </section>}
 <section id="config-native-tls" tabIndex={-1} hidden={searching || activeSubpage !== 'general'}
             className="surface-card config-network-section"
             aria-labelledby="config-tls-section-title"
@@ -1744,126 +2070,114 @@ export function ConfigPanelPage() {
             <div className="config-tls-section-title">
               <LockKeyhole size={18} aria-hidden="true" />
               <h3 id="config-tls-section-title">{t('config.tls.enable')}</h3>
+              <SettingsHelp label={t('config.tls.enable')}>{t('config.tls.enableDescription')} {t('config.tls.restartHint')}</SettingsHelp>
             </div>
             <div className="config-heading-actions">
-              {busyAction === 'tls' ? (
+              {tlsSettingsDirty ? (
+                <div className="config-inline-dirty-actions">
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    disabled={tlsControlsDisabled || tlsFileSelecting !== null}
+                    onClick={discardTlsDraft}
+                  >
+                    {t('agents.catalog.discard')}
+                  </button>
+                  <button
+                    type="button"
+                    className="primary-button compact-button"
+                    disabled={tlsControlsDisabled || tlsFileSelecting !== null}
+                    onClick={() => void saveTlsSettings()}
+                  >
+                    <Check size={15} aria-hidden="true" />
+                    {busyAction === 'tls' ? t('common.saving') : t('common.save')}
+                  </button>
+                </div>
+              ) : busyAction === 'tls' ? (
                 <span className="state-pill">{t('common.saving')}</span>
               ) : tlsStatusLabel ? (
                 <span className={`state-pill ${tlsStatusIsSaved ? 'success' : ''}`}>
                   {tlsStatusLabel}
                 </span>
               ) : null}
-
+              <Switch title={t('config.tls.enable')} aria-label={t('config.tls.enable')} checked={tlsEnabledDraft} disabled={tlsControlsDisabled} onChange={(event) => {
+                setTlsSavedStatusVisible(false);
+                setTlsError('');
+                setTlsEnabledDraft(event.currentTarget.checked);
+              }} />
             </div>
           </div>
 
           {nativeSectionsPending ? renderNativeSkeleton() : (<>
-          <div className="config-tls-content">
-            <div className="config-software-setting-row config-tls-toggle-row">
-              <div className="config-software-setting-copy">
-                <span className="config-software-setting-icon" aria-hidden="true">
-                  <ShieldCheck size={18} />
-                </span>
-                <div>
-                  <span className="config-field-label"><strong>{t('config.tls.enable')}</strong><SettingsHelp label={t('config.tls.enable')}>{t('config.tls.enableDescription')} {t('config.tls.restartHint')}</SettingsHelp></span>
-
+          {tlsEnabledDraft || tlsError ? (
+            <div className="config-tls-content">
+              {tlsEnabledDraft ? (
+                <div className="config-tls-fields">
+                  <div className="config-network-field">
+                    <span className="config-field-label"><span>{t('config.tls.cert')}</span><SettingsHelp label={t('config.tls.cert')}>{t('config.tls.certHint')}</SettingsHelp></span>
+                    <div className="config-tls-path-control">
+                      <input
+                        className={`config-network-input ${tlsError && !tlsCertDraft.trim() ? 'error' : ''}`}
+                        type="text"
+                        value={tlsCertDraft}
+                        aria-label={t('config.tls.cert')}
+                        disabled={tlsControlsDisabled || tlsFileSelecting !== null}
+                        placeholder={t('config.tls.certPlaceholder')}
+                        onChange={(event) => {
+                          setTlsSavedStatusVisible(false);
+                          setTlsError('');
+                          setTlsCertDraft(event.currentTarget.value);
+                        }}
+                      />
+                      <button
+                        type="button"
+                        className="secondary-button compact-button config-tls-browse-button"
+                        disabled={Boolean(selectedRemoteEndpoint()) || tlsControlsDisabled || tlsFileSelecting !== null}
+                        title={t(selectedRemoteEndpoint() ? 'remote.serverFilePath' : 'config.tls.selectCertTitle')}
+                        onClick={() => void selectTlsFile('cert')}
+                      >
+                        <FolderOpen size={16} aria-hidden="true" />
+                        {tlsFileSelecting === 'cert' ? t('common.processing') : t('config.tls.browse')}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="config-network-field">
+                    <span className="config-field-label"><span>{t('config.tls.key')}</span><SettingsHelp label={t('config.tls.key')}>{t('config.tls.keyHint')}</SettingsHelp></span>
+                    <div className="config-tls-path-control">
+                      <input
+                        className={`config-network-input ${tlsError && !tlsKeyDraft.trim() ? 'error' : ''}`}
+                        type="text"
+                        value={tlsKeyDraft}
+                        aria-label={t('config.tls.key')}
+                        disabled={tlsControlsDisabled || tlsFileSelecting !== null}
+                        placeholder={t('config.tls.keyPlaceholder')}
+                        onChange={(event) => {
+                          setTlsSavedStatusVisible(false);
+                          setTlsError('');
+                          setTlsKeyDraft(event.currentTarget.value);
+                        }}
+                      />
+                      <button
+                        type="button"
+                        className="secondary-button compact-button config-tls-browse-button"
+                        disabled={Boolean(selectedRemoteEndpoint()) || tlsControlsDisabled || tlsFileSelecting !== null}
+                        title={t(selectedRemoteEndpoint() ? 'remote.serverFilePath' : 'config.tls.selectKeyTitle')}
+                        onClick={() => void selectTlsFile('key')}
+                      >
+                        <FolderOpen size={16} aria-hidden="true" />
+                        {tlsFileSelecting === 'key' ? t('common.processing') : t('config.tls.browse')}
+                      </button>
+                    </div>
+                  </div>
                 </div>
-              </div>
-              <Switch title={t('config.tls.enable')} aria-label={t('config.tls.enable')} checked={tlsEnabledDraft} disabled={tlsControlsDisabled} onChange={(event) => {
-                    setTlsSavedStatusVisible(false);
-                    setTlsError('');
-                    setTlsEnabledDraft(event.currentTarget.checked);
-                  }} />
+              ) : null}
+              <MessageNotice message={tlsError} onDismiss={() => setTlsError('')} />
             </div>
-
-            {tlsEnabledDraft ? (
-              <div className="config-tls-fields">
-                <div className="config-network-field">
-                  <span className="config-field-label"><span>{t('config.tls.cert')}</span><SettingsHelp label={t('config.tls.cert')}>{t('config.tls.certHint')}</SettingsHelp></span>
-                  <div className="config-tls-path-control">
-                    <input
-                      className={`config-network-input ${tlsError && !tlsCertDraft.trim() ? 'error' : ''}`}
-                      type="text"
-                      value={tlsCertDraft}
-                      aria-label={t('config.tls.cert')}
-                      disabled={tlsControlsDisabled || tlsFileSelecting !== null}
-                      placeholder={t('config.tls.certPlaceholder')}
-                      onChange={(event) => {
-                        setTlsSavedStatusVisible(false);
-                        setTlsError('');
-                        setTlsCertDraft(event.currentTarget.value);
-                      }}
-                    />
-                    <button
-                      type="button"
-                      className="secondary-button compact-button config-tls-browse-button"
-                      disabled={tlsControlsDisabled || tlsFileSelecting !== null}
-                      title={t('config.tls.selectCertTitle')}
-                      onClick={() => void selectTlsFile('cert')}
-                    >
-                      <FolderOpen size={16} aria-hidden="true" />
-                      {tlsFileSelecting === 'cert' ? t('common.processing') : t('config.tls.browse')}
-                    </button>
-                  </div>
-
-                </div>
-                <div className="config-network-field">
-                  <span className="config-field-label"><span>{t('config.tls.key')}</span><SettingsHelp label={t('config.tls.key')}>{t('config.tls.keyHint')}</SettingsHelp></span>
-                  <div className="config-tls-path-control">
-                    <input
-                      className={`config-network-input ${tlsError && !tlsKeyDraft.trim() ? 'error' : ''}`}
-                      type="text"
-                      value={tlsKeyDraft}
-                      aria-label={t('config.tls.key')}
-                      disabled={tlsControlsDisabled || tlsFileSelecting !== null}
-                      placeholder={t('config.tls.keyPlaceholder')}
-                      onChange={(event) => {
-                        setTlsSavedStatusVisible(false);
-                        setTlsError('');
-                        setTlsKeyDraft(event.currentTarget.value);
-                      }}
-                    />
-                    <button
-                      type="button"
-                      className="secondary-button compact-button config-tls-browse-button"
-                      disabled={tlsControlsDisabled || tlsFileSelecting !== null}
-                      title={t('config.tls.selectKeyTitle')}
-                      onClick={() => void selectTlsFile('key')}
-                    >
-                      <FolderOpen size={16} aria-hidden="true" />
-                      {tlsFileSelecting === 'key' ? t('common.processing') : t('config.tls.browse')}
-                    </button>
-                  </div>
-
-                </div>
-              </div>
-            ) : null}
-
-            <MessageNotice message={tlsError} onDismiss={() => setTlsError('')} />
-
-            {renderFeedback(tlsFeedback)}
-          </div>
-
-          {tlsSettingsDirty ? (
-            <Notice tone="warn" icon={<AlertCircle size={16} />}>{st('restart')}</Notice>
           ) : null}
-
-          <div className="config-settings-save-row"><button
-                type="button"
-                className="secondary-button compact-button"
-                disabled={tlsControlsDisabled || tlsFileSelecting !== null || !tlsSettingsDirty}
-                onClick={discardTlsDraft}
-              >
-                {t('agents.catalog.discard')}
-              </button><button
-                type="button"
-                className="primary-button compact-button"
-                disabled={tlsControlsDisabled || tlsFileSelecting !== null || !tlsSettingsDirty}
-                onClick={() => void saveTlsSettings()}
-              >
-                <Check size={16} aria-hidden="true" />
-                {busyAction === 'tls' ? t('common.saving') : t('common.save')}
-              </button></div></>)}
+          {renderFeedback(tlsFeedback, !searching && activeSubpage === 'general')}
+          {tlsSettingsDirty ? (
+            <Notice tone="warn" icon={<AlertCircle size={16} />}>{st(external ? 'externalRestart' : 'restart')}</Notice>
+          ) : null}</>)}
         </section>
         <section
           id="config-native-reverse-proxy"
@@ -1876,6 +2190,7 @@ export function ConfigPanelPage() {
             <div className="config-tls-section-title">
               <Network size={18} aria-hidden="true" />
               <h3 id="config-reverse-proxy-section-title">{st('reverseProxyTitle')}</h3>
+              <SettingsHelp label={st('reverseProxyTitle')}>{st('reverseProxyIntro')} {st('reverseProxyEnableHint')} {st('reverseProxySaveApplyHint')}</SettingsHelp>
             </div>
             <div className="config-heading-actions">
               {proxyAction !== null ? (
@@ -1885,10 +2200,43 @@ export function ConfigPanelPage() {
                   {proxyState.running ? st('reverseProxyRunning') : st('reverseProxyStopped')}
                 </span>
               ) : null}
+              {!external && proxyDirty ? (
+                <div className="config-inline-dirty-actions">
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    disabled={proxyControlsDisabled || proxyInitialLoading}
+                    onClick={discardProxyDraft}
+                  >
+                    {t('agents.catalog.discard')}
+                  </button>
+                  <button
+                    type="button"
+                    className="primary-button compact-button"
+                    disabled={proxyControlsDisabled || proxyInitialLoading}
+                    onClick={() => void handleProxySave()}
+                  >
+                    <Check size={15} aria-hidden="true" />
+                    {proxyAction === 'save' ? t('common.saving') : t('common.save')}
+                  </button>
+                </div>
+              ) : null}
+              {!external ? (
+                <Switch
+                  title={st('reverseProxyEnable')}
+                  aria-label={st('reverseProxyEnable')}
+                  aria-checked={proxyDraft.enabled}
+                  checked={proxyDraft.enabled}
+                  disabled={proxyControlsDisabled}
+                  onChange={(event) => {
+                    void handleProxyToggle(event.currentTarget.checked);
+                  }}
+                />
+              ) : null}
             </div>
           </div>
 
-          {proxyInitialLoading ? (
+          {external ? <Notice tone="info">{st('externalUnsupported')}</Notice> : proxyInitialLoading ? (
             <div className="config-tls-content" aria-busy="true">
               <div className="config-key-row skeleton" aria-hidden="true">
                 <span />
@@ -1911,111 +2259,194 @@ export function ConfigPanelPage() {
                 </Notice>
               ) : null}
 
-              <p className="config-diagnostics-intro">
-                {st('reverseProxyIntro')}
-              </p>
-
-              <div className="config-software-setting-row config-tls-toggle-row">
-                <div className="config-software-setting-copy">
-                  <span className="config-software-setting-icon" aria-hidden="true">
-                    <Network size={18} />
-                  </span>
-                  <div>
-                    <span className="config-field-label">
-                      <strong>{st('reverseProxyEnable')}</strong>
-                      <SettingsHelp label={st('reverseProxyEnable')}>{st('reverseProxyEnableHint')}</SettingsHelp>
-                    </span>
-                  </div>
-                </div>
-                <Switch
-                  title={st('reverseProxyEnable')}
-                  aria-label={st('reverseProxyEnable')}
-                  aria-checked={proxyDraft.enabled}
-                  checked={proxyDraft.enabled}
-                  disabled={proxyControlsDisabled}
-                  onChange={(event) => {
-                    void handleProxyToggle(event.currentTarget.checked);
-                  }}
-                />
-              </div>
-
-              <p className="config-diagnostics-intro">
-                {st('reverseProxyEnableHint')} {st('reverseProxySaveApplyHint')}
-              </p>
-
-              <div className="config-network-label">
-                <strong>{st('reverseProxyRouteTitle')}</strong>
-              </div>
-              <p className="config-diagnostics-intro">
-                {st('reverseProxyRouteClientHint')}
-              </p>
-
-              <div className={`config-network-grid config-network-route${proxyDraft.enabled ? '' : ' is-muted'}`}>
+              <div className={`surface-section surface-muted config-network-grid config-reverse-proxy-status-bar${proxyState?.running ? ' is-running' : ''}`} aria-label={st('reverseProxyStatus')}>
                 <div className="config-network-field">
-                  <span className="config-field-label"><span>{st('reverseProxyRoutePreview')}</span></span>
-                  <span>
-                    <code>{`0.0.0.0:${proxyDraft.listenPort || 443}(HTTPS)`}</code>
-                    {' '}
-                    <ArrowRight size={14} aria-hidden="true" />
-                    {' '}
-                    <code>{`127.0.0.1:${proxyDraft.targetPort || (settings?.port ?? 8317)}`}</code>
+                  <span className="config-field-label"><span>{st('reverseProxyStatusRunning')}</span></span>
+                  <span className="config-rp-status-value">
+                    <span className={`config-rp-status-dot${proxyState?.running ? ' is-running' : ''}`} aria-hidden="true" />
+                    <span>{proxyState?.running ? st('reverseProxyRunning') : st('reverseProxyStopped')}</span>
                   </span>
                 </div>
-
                 <div className="config-network-field">
-                  <span className="config-field-label">
-                    <label htmlFor="config-input-reverse-proxy-listen-port">{st('reverseProxyListenPort')}</label>
-                    <SettingsHelp label={st('reverseProxyListenPort')}>{st('reverseProxyListenPortHint')}</SettingsHelp>
-                  </span>
-                  <input
-                    id="config-input-reverse-proxy-listen-port"
-                    className={`config-network-input ${proxyFieldErrors.listenPort ? 'error' : ''}`}
-                    type="number"
-                    min={1}
-                    max={65535}
-                    value={proxyDraft.listenPort || ''}
-                    disabled={proxyControlsDisabled}
-                    placeholder="443"
-                    aria-invalid={Boolean(proxyFieldErrors.listenPort)}
-                    aria-describedby={proxyFieldErrors.listenPort ? 'config-reverse-proxy-listen-port-error' : undefined}
-                    onChange={(event) => {
-                      const val = parseInt(event.currentTarget.value, 10);
-                      setProxyDraft(prev => ({ ...prev, listenPort: Number.isNaN(val) ? 0 : val }));
-                      setProxyDirty(true);
-                      clearProxyFieldError('listenPort');
-                    }}
-                  />
-                  <span id="config-reverse-proxy-listen-port-error" className="config-field-error" role="alert">{proxyFieldErrors.listenPort || ' '}</span>
+                  <span className="config-field-label"><span>{st('reverseProxyStatusListening')}</span></span>
+                  <span>{proxyState?.listening ?? '—'}</span>
+                </div>
+                <div className="config-network-field">
+                  <span className="config-field-label"><span>{st('reverseProxyStatusTarget')}</span></span>
+                  <span>{proxyState?.target ?? '—'}</span>
+                </div>
+                <div className="config-network-field">
+                  <span className="config-field-label"><span>{st('reverseProxyStatusRequests')}</span></span>
+                  <span>{String(proxyState?.requestsTotal ?? 0)}</span>
                 </div>
               </div>
 
-              {proxyState?.running && proxyState.listening ? (
-                <div className="config-network-grid" aria-label={st('reverseProxyRouteTitle')}>
-                  <div className="config-network-field">
-                    <span className="config-field-label"><span>{st('reverseProxyRoutePublic')}</span></span>
-                    <span>
-                      <code>{`https://${proxyLanIp ?? `<${st('reverseProxyRouteHostPlaceholder')}>`}:${proxyState.listening.split(':').pop() ?? ''}`}</code>
+              {proxyState?.running && proxyState.listening ? (() => {
+                const configuredHost = proxyState.config?.listenHost?.trim();
+                const isWildcardHost = !configuredHost || configuredHost === '0.0.0.0' || configuredHost === '::';
+                const clientHost = isWildcardHost
+                  ? (proxyLanIp ?? `<${st('reverseProxyRouteHostPlaceholder')}>`)
+                  : (configuredHost.includes(':') ? `[${configuredHost}]` : configuredHost);
+                return (
+                  <div className="config-rp-route-bar is-live" aria-label={st('reverseProxyRouteTitle')}>
+                    <span className="config-rp-route-item">
+                      <span className="config-rp-route-label">{st('reverseProxyRoutePublic')}</span>
+                      <code>{`https://${clientHost}:${proxyState.listening.split(':').pop() ?? ''}`}</code>
                     </span>
+                    <span className="config-rp-route-forward" aria-hidden="true">
+                      <span>{st('reverseProxyForwardTo')}</span>
+                      <ArrowRight size={14} />
+                    </span>
+                    <span className="config-rp-route-item">
+                      <span className="config-rp-route-label">{st('reverseProxyRouteLocal')}</span>
+                      <code>{proxyState.target ?? '—'}</code>
+                    </span>
+                    <SettingsHelp label={st('reverseProxyRouteTitle')}>{st('reverseProxyRouteClientHint')}</SettingsHelp>
                   </div>
-                  <div className="config-network-field">
-                    <span className="config-field-label"><span>{st('reverseProxyRouteLocal')}</span></span>
-                    <span><code>{proxyState.target ?? '—'}</code></span>
-                  </div>
-                </div>
+                );
+              })() : null}
+
+              {proxyState?.hardening ? (
+                proxyState.hardening.loopbackBind && proxyState.hardening.trustedProxies && !proxyState.hardening.restartRequired ? (
+                  <Notice tone="success">
+                    {st('reverseProxyHardeningOk')}
+                  </Notice>
+                ) : proxyState.running && proxyState.hardening.restartRequired ? (
+                  <Notice tone="warn">
+                    {st('reverseProxyHardeningPending')}
+                  </Notice>
+                ) : proxyState.running && (!proxyState.hardening.loopbackBind || !proxyState.hardening.trustedProxies) ? (
+                  <Notice tone="warn">
+                    {st('reverseProxyHardeningFailed')}
+                  </Notice>
+                ) : null
               ) : null}
 
-              <div className="config-network-label">
-                <strong>{st('reverseProxyCertTitle')}</strong>
-              </div>
-              <p className="config-diagnostics-intro">
-                {st('reverseProxyCertIntro')}
-              </p>
+              {proxyState?.error ? (
+                <Notice tone="error" className="config-reverse-proxy-error">
+                  {proxyState.error}
+                </Notice>
+              ) : null}
 
-              <div className={`config-network-grid${proxyDraft.enabled ? '' : ' is-muted'}`}>
+              <div aria-live="polite">
+                {renderFeedback(proxyFeedback, !searching && activeSubpage === 'proxy')}
+              </div>
+
+              <div className="config-rp-topology">
+                <div className="surface-section surface-muted config-rp-node">
+                  <div className="config-rp-node-header">
+                    <span className="config-field-label">
+                      <label htmlFor="config-input-reverse-proxy-listen-host">{st('reverseProxyListenEndpoint')}</label>
+                      <SettingsHelp label={st('reverseProxyListenEndpoint')}>
+                        {st('reverseProxyListenHostHint')}（{st('reverseProxyBindHint')}） · {st('reverseProxyListenPortHint')} · {st('reverseProxyRoutePreview')}：{st('reverseProxyRouteClientHint')}
+                      </SettingsHelp>
+                    </span>
+                    <span className="config-rp-proto-badge is-https">HTTPS</span>
+                  </div>
+                  <div className="config-rp-split-inputs">
+                    <input
+                      id="config-input-reverse-proxy-listen-host"
+                      className={`config-network-input config-rp-host-input ${proxyFieldErrors.listenHost ? 'error' : ''}`}
+                      type="text"
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={proxyDraft.listenHost}
+                      disabled={proxyControlsDisabled}
+                      placeholder="0.0.0.0"
+                      aria-label={st('reverseProxyListenHost')}
+                      aria-invalid={Boolean(proxyFieldErrors.listenHost)}
+                      aria-describedby={proxyFieldErrors.listenHost ? 'config-reverse-proxy-listen-port-error' : undefined}
+                      onChange={(event) => {
+                        const nextHost = event.currentTarget.value;
+                        setProxyDraft(prev => ({ ...prev, listenHost: nextHost }));
+                        setProxyDirty(true);
+                        clearProxyFieldError('listenHost');
+                      }}
+                    />
+                    <span className="config-rp-colon" aria-hidden="true">:</span>
+                    <input
+                      id="config-input-reverse-proxy-listen-port"
+                      className={`config-network-input config-rp-port-input ${proxyFieldErrors.listenPort ? 'error' : ''}`}
+                      type="text"
+                      inputMode="numeric"
+                      pattern="[0-9]*"
+                      maxLength={5}
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={listenPortInput}
+                      disabled={proxyControlsDisabled}
+                      placeholder="1 - 65535"
+                      aria-label={st('reverseProxyListenPort')}
+                      aria-invalid={Boolean(proxyFieldErrors.listenPort)}
+                      aria-describedby={proxyFieldErrors.listenPort ? 'config-reverse-proxy-listen-port-error' : undefined}
+                      onChange={(event) => {
+                        updateProxyPortInput('listenPort', event.currentTarget.value, Boolean((event.nativeEvent as InputEvent).isComposing));
+                      }}
+                      onCompositionEnd={(event) => {
+                        updateProxyPortInput('listenPort', event.currentTarget.value, false);
+                      }}
+                    />
+                  </div>
+                  <span id="config-reverse-proxy-listen-port-error" className="config-field-error" role="alert">
+                    {proxyFieldErrors.listenHost || proxyFieldErrors.listenPort}
+                  </span>
+                </div>
+
+                <div className="config-rp-connector" aria-hidden="true">
+                  <span className="config-rp-connector-label">{st('reverseProxyForwardTo')}</span>
+                  <ArrowRight size={14} className="config-rp-connector-arrow" />
+                </div>
+
+                <div className="surface-section surface-muted config-rp-node">
+                  <div className="config-rp-node-header">
+                    <span className="config-field-label">
+                      <label htmlFor="config-input-reverse-proxy-target-port">{st('reverseProxyTargetEndpoint')}</label>
+                      <SettingsHelp label={st('reverseProxyTargetEndpoint')}>
+                        {st('reverseProxyTargetPortHint')} {st('reverseProxyAdvancedHint')}
+                      </SettingsHelp>
+                    </span>
+                    <span className="config-rp-proto-badge">{st('reverseProxyRouteLocal')}</span>
+                  </div>
+                  <div className="config-rp-split-inputs">
+                    <label
+                      htmlFor="config-input-reverse-proxy-target-port"
+                      className="config-rp-locked-host"
+                    >
+                      <code>127.0.0.1</code>
+                    </label>
+                    <span className="config-rp-colon" aria-hidden="true">:</span>
+                    <input
+                      id="config-input-reverse-proxy-target-port"
+                      className={`config-network-input config-rp-port-input ${proxyFieldErrors.targetPort ? 'error' : ''}`}
+                      type="text"
+                      inputMode="numeric"
+                      pattern="[0-9]*"
+                      maxLength={5}
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={targetPortInput}
+                      disabled={proxyControlsDisabled}
+                      placeholder={String(settings?.port ?? 8317)}
+                      aria-label={st('reverseProxyTargetPort')}
+                      aria-invalid={Boolean(proxyFieldErrors.targetPort)}
+                      aria-describedby={proxyFieldErrors.targetPort ? 'config-reverse-proxy-target-port-error' : undefined}
+                      onChange={(event) => {
+                        updateProxyPortInput('targetPort', event.currentTarget.value, Boolean((event.nativeEvent as InputEvent).isComposing));
+                      }}
+                      onCompositionEnd={(event) => {
+                        updateProxyPortInput('targetPort', event.currentTarget.value, false);
+                      }}
+                    />
+                  </div>
+                  <span id="config-reverse-proxy-target-port-error" className="config-field-error" role="alert">{proxyFieldErrors.targetPort}</span>
+                </div>
+              </div>
+
+              <div className="config-network-grid">
                 <div className="config-network-field">
                   <span className="config-field-label">
                     <label htmlFor="config-input-reverse-proxy-cert-path">{st('reverseProxyCertPath')}</label>
-                    <SettingsHelp label={st('reverseProxyCertPath')}>{st('reverseProxyCertPathHint')}</SettingsHelp>
+                    <SettingsHelp label={st('reverseProxyCertPath')}>{st('reverseProxyCertPathHint')} {st('reverseProxyCertIntro')}</SettingsHelp>
                   </span>
                   <div className="config-tls-path-control">
                     <input
@@ -2047,7 +2478,7 @@ export function ConfigPanelPage() {
                       {proxyFileSelecting === 'cert' ? t('common.processing') : t('config.tls.browse')}
                     </button>
                   </div>
-                  <span id="config-reverse-proxy-cert-path-error" className="config-field-error" role="alert">{proxyFieldErrors.certPath || ' '}</span>
+                  <span id="config-reverse-proxy-cert-path-error" className="config-field-error" role="alert">{proxyFieldErrors.certPath}</span>
                 </div>
 
                 <div className="config-network-field">
@@ -2085,117 +2516,11 @@ export function ConfigPanelPage() {
                       {proxyFileSelecting === 'key' ? t('common.processing') : t('config.tls.browse')}
                     </button>
                   </div>
-                  <span id="config-reverse-proxy-key-path-error" className="config-field-error" role="alert">{proxyFieldErrors.keyPath || ' '}</span>
+                  <span id="config-reverse-proxy-key-path-error" className="config-field-error" role="alert">{proxyFieldErrors.keyPath}</span>
                 </div>
-              </div>
-
-              <div className="config-network-grid" aria-label={st('reverseProxyStatus')}>
-                <div className="config-network-field">
-                  <span className="config-field-label"><span>{st('reverseProxyStatusRunning')}</span></span>
-                  <span>{proxyState?.running ? st('reverseProxyRunning') : st('reverseProxyStopped')}</span>
-                </div>
-                <div className="config-network-field">
-                  <span className="config-field-label"><span>{st('reverseProxyStatusListening')}</span></span>
-                  <span>{proxyState?.listening ?? '—'}</span>
-                </div>
-                <div className="config-network-field">
-                  <span className="config-field-label"><span>{st('reverseProxyStatusTarget')}</span></span>
-                  <span>{proxyState?.target ?? '—'}</span>
-                </div>
-                <div className="config-network-field">
-                  <span className="config-field-label"><span>{st('reverseProxyStatusRequests')}</span></span>
-                  <span>{String(proxyState?.requestsTotal ?? 0)}</span>
-                </div>
-              </div>
-
-              {proxyState?.hardening ? (
-                proxyState.hardening.loopbackBind && proxyState.hardening.trustedProxies && !proxyState.hardening.restartRequired ? (
-                  <Notice tone="success">
-                    {st('reverseProxyHardeningOk')}
-                  </Notice>
-                ) : proxyState.running && proxyState.hardening.restartRequired ? (
-                  <Notice tone="warn">
-                    {st('reverseProxyHardeningPending')}
-                  </Notice>
-                ) : proxyState.running && (!proxyState.hardening.loopbackBind || !proxyState.hardening.trustedProxies) ? (
-                  <Notice tone="warn">
-                    {st('reverseProxyHardeningFailed')}
-                  </Notice>
-                ) : null
-              ) : null}
-
-              <details>
-                <summary>{st('reverseProxyAdvancedTitle')}</summary>
-                <p className="config-diagnostics-intro">{st('reverseProxyAdvancedHint')}</p>
-                <div className="config-network-grid">
-                  <div className="config-network-field">
-                    <span className="config-field-label">
-                      <span>{st('reverseProxyListenHost')}</span>
-                      <SettingsHelp label={st('reverseProxyListenHost')}>{st('reverseProxyListenHostHint')}</SettingsHelp>
-                    </span>
-                    <code>0.0.0.0</code>
-                    <small>{st('reverseProxyBindHint')}</small>
-                  </div>
-
-                  <div className="config-network-field">
-                    <span className="config-field-label">
-                      <label htmlFor="config-input-reverse-proxy-target-port">{st('reverseProxyTargetPort')}</label>
-                      <SettingsHelp label={st('reverseProxyTargetPort')}>{st('reverseProxyTargetPortHint')}</SettingsHelp>
-                    </span>
-                    <input
-                      id="config-input-reverse-proxy-target-port"
-                      className={`config-network-input ${proxyFieldErrors.targetPort ? 'error' : ''}`}
-                      type="number"
-                      min={1}
-                      max={65535}
-                      value={proxyDraft.targetPort || ''}
-                      disabled={proxyControlsDisabled}
-                      placeholder={String(settings?.port ?? 8317)}
-                      aria-invalid={Boolean(proxyFieldErrors.targetPort)}
-                      aria-describedby={proxyFieldErrors.targetPort ? 'config-reverse-proxy-target-port-error' : undefined}
-                      onChange={(event) => {
-                        const val = parseInt(event.currentTarget.value, 10);
-                        setProxyDraft(prev => ({ ...prev, targetPort: Number.isNaN(val) ? 0 : val }));
-                        setProxyDirty(true);
-                        clearProxyFieldError('targetPort');
-                      }}
-                    />
-                    <span id="config-reverse-proxy-target-port-error" className="config-field-error" role="alert">{proxyFieldErrors.targetPort || ' '}</span>
-                  </div>
-                </div>
-              </details>
-
-              {proxyState?.error ? (
-                <Notice tone="error" className="config-reverse-proxy-error">
-                  {proxyState.error}
-                </Notice>
-              ) : null}
-
-              <div aria-live="polite">
-                {renderFeedback(proxyFeedback)}
               </div>
             </div>
           )}
-
-          <div className="config-settings-save-row">
-            <button
-              type="button"
-              className="secondary-button compact-button"
-              disabled={proxyControlsDisabled || proxyInitialLoading || !proxyDirty}
-              onClick={discardProxyDraft}
-            >
-              {t('agents.catalog.discard')}
-            </button>
-            <button
-              type="button"
-              className="primary-button compact-button"
-              disabled={proxyControlsDisabled || proxyInitialLoading || !proxyDirty}
-              onClick={() => void handleProxySave()}
-            >
-              <Check size={16} aria-hidden="true" />
-              {proxyAction === 'save' ? t('common.saving') : t('common.save')}
-            </button>
-          </div>
         </section>
 <section id="config-native-routing" tabIndex={-1} hidden={searching || activeSubpage !== 'routing'}
             className="surface-card config-network-section"
@@ -2206,10 +2531,33 @@ export function ConfigPanelPage() {
                 <Route size={16} aria-hidden="true" />
                 <h3 id="config-routing-section-title">{st('nativeRouting')}</h3>
               </div>
-              <span className="config-card-status" role="status">{busyAction === 'routing' ? <span className="state-pill">{t('common.saving')}</span> : nativeDirty.routing ? st('dirty') : ''}</span>
-
+              <div className="config-heading-actions">
+                {sessionRoutingDirty ? (
+                  <div className="config-inline-dirty-actions">
+                    <button
+                      type="button"
+                      className="secondary-button compact-button"
+                      disabled={routingControlsDisabled}
+                      onClick={discardSessionRoutingDraft}
+                    >
+                      {t('agents.catalog.discard')}
+                    </button>
+                    <button
+                      type="button"
+                      className="primary-button compact-button"
+                      disabled={routingControlsDisabled}
+                      onClick={() => void saveSessionRoutingSettings()}
+                    >
+                      <Check size={15} aria-hidden="true" />
+                      {busyAction === 'routing' ? t('common.saving') : t('common.save')}
+                    </button>
+                  </div>
+                ) : busyAction === 'routing' ? (
+                  <span className="state-pill">{t('common.saving')}</span>
+                ) : null}
+              </div>
             </div>
-            {renderFeedback(routingFeedback)}
+            {renderFeedback(routingFeedback, !searching && activeSubpage === 'routing')}
             {nativeSectionsPending ? renderNativeSkeleton() : (<>
             <div className="config-network-grid">
               <div className="config-network-field config-network-toggle">
@@ -2244,7 +2592,7 @@ export function ConfigPanelPage() {
                   }}
                 />
                 <small id="config-network-sessionTtl-format">{t('config.network.sessionTtlFormat')}</small>
-                <span id="config-network-sessionTtl-error" className="config-field-error" role="alert">{sessionTtlError || ' '}</span>
+                <span id="config-network-sessionTtl-error" className="config-field-error" role="alert">{sessionTtlError}</span>
 
               </div>
 
@@ -2265,24 +2613,7 @@ export function ConfigPanelPage() {
                       : routingStrategyLabel(settings.routingStrategy, t, locale)}
                 </small>
               </div>
-            </div>
-
-          <div className="config-settings-save-row"><button
-                type="button"
-                className="secondary-button compact-button"
-                disabled={routingControlsDisabled || !sessionRoutingDirty}
-                onClick={discardSessionRoutingDraft}
-              >
-                {t('agents.catalog.discard')}
-              </button><button
-                type="button"
-                className="primary-button compact-button"
-                disabled={routingControlsDisabled || !sessionRoutingDirty}
-                onClick={() => void saveSessionRoutingSettings()}
-              >
-                <Check size={16} aria-hidden="true" />
-                {busyAction === 'routing' ? t('common.saving') : t('common.save')}
-              </button></div></>)}
+            </div></>)}
         </section>
 <section id="config-native-retry" tabIndex={-1} hidden={searching || activeSubpage !== 'routing'}
             className="surface-card config-network-section"
@@ -2293,10 +2624,33 @@ export function ConfigPanelPage() {
                 <RefreshCw size={16} aria-hidden="true" />
                 <h3 id="config-retry-section-title">{st('nativeRetry')}</h3>
               </div>
-              <span className="config-card-status" role="status">{busyAction === 'retry' ? <span className="state-pill">{t('common.saving')}</span> : nativeDirty.retry ? st('dirty') : ''}</span>
-
+              <div className="config-heading-actions">
+                {retrySettingsDirty ? (
+                  <div className="config-inline-dirty-actions">
+                    <button
+                      type="button"
+                      className="secondary-button compact-button"
+                      disabled={retryControlsDisabled}
+                      onClick={discardRetryDraft}
+                    >
+                      {t('agents.catalog.discard')}
+                    </button>
+                    <button
+                      type="button"
+                      className="primary-button compact-button"
+                      disabled={retryControlsDisabled}
+                      onClick={() => void saveRetrySettings()}
+                    >
+                      <Check size={15} aria-hidden="true" />
+                      {busyAction === 'retry' ? t('common.saving') : t('common.save')}
+                    </button>
+                  </div>
+                ) : busyAction === 'retry' ? (
+                  <span className="state-pill">{t('common.saving')}</span>
+                ) : null}
+              </div>
             </div>
-            {renderFeedback(retryFeedback)}
+            {renderFeedback(retryFeedback, !searching && activeSubpage === 'routing')}
             {nativeSectionsPending ? renderNativeSkeleton() : (<>
             <div className="config-network-grid">
               <CoolingToggle disabledCooling={disableCoolingDraft} disabled={retryControlsDisabled}
@@ -2349,7 +2703,6 @@ export function ConfigPanelPage() {
 
               <div className="config-network-field">
                 <span className="config-field-label"><label htmlFor="config-input-config-network-maxRetryInterval">{t('config.network.maxRetryInterval')}</label><SettingsHelp label={t('config.network.maxRetryInterval')}>{templateText(templateMessages.waitHint, locale)}</SettingsHelp></span>
-                <span className="config-input-with-unit">
                 <input
                   id="config-input-config-network-maxRetryInterval"
                   className={`config-network-input ${retryError ? 'error' : ''}`}
@@ -2367,8 +2720,6 @@ export function ConfigPanelPage() {
                     setRetryError('');
                   }}
                 />
-                <span className="config-input-unit" aria-hidden="true">{t('config.unit.seconds')}</span>
-                </span>
 
               </div>
 
@@ -2392,24 +2743,7 @@ export function ConfigPanelPage() {
                 />
 
               </div>
-            </div>
-
-          <div className="config-settings-save-row"><button
-                type="button"
-                className="secondary-button compact-button"
-                disabled={retryControlsDisabled || !retrySettingsDirty}
-                onClick={discardRetryDraft}
-              >
-                {t('agents.catalog.discard')}
-              </button><button
-                type="button"
-                className="primary-button compact-button"
-                disabled={retryControlsDisabled || !retrySettingsDirty}
-                onClick={() => void saveRetrySettings()}
-              >
-                <Check size={16} aria-hidden="true" />
-                {busyAction === 'retry' ? t('common.saving') : t('common.save')}
-              </button></div></>)}
+            </div></>)}
         </section>
 <section id="config-native-logging" tabIndex={-1} hidden={searching || activeSubpage !== 'diagnostics'} className="panel surface-card config-diagnostics-panel">
           <div className="config-panel-heading">
@@ -2418,247 +2752,294 @@ export function ConfigPanelPage() {
               <h2>{t('config.diagnostics.title')}</h2>
             </div>
             <div className="config-heading-actions">
-              {loggingSettingsBusy ? <span className="state-pill">{t('common.saving')}</span> : null}
+              {loggingSettingsBusy ? (
+                <span className="state-pill">{t('common.saving')}</span>
+              ) : loggingSettingsDirty ? (
+                <span className="state-pill">{t('config.network.unsaved')}</span>
+              ) : null}
+              <button
+                type="button"
+                className="secondary-button compact-button"
+                disabled={diagnosticsControlsDisabled || (external && !settings?.loggingToFile)}
+                title={external && !settings?.loggingToFile ? st('enableFileLogs') : undefined}
+                onClick={() => void handleOpenCoreLogsDirectory()}
+              >
+                <FolderOpen size={15} aria-hidden="true" />
+                {external ? st('readLogs') : t('config.diagnostics.openLogs')}
+              </button>
             </div>
           </div>
 
           {nativeSectionsPending ? renderNativeSkeleton() : (<>
-          <div className="config-diagnostics-toggle-grid">
-            <div className="config-diagnostics-setting">
-              <span className="config-diagnostics-setting-icon" aria-hidden="true"><Bug size={18} /></span>
-              <div className="config-diagnostics-setting-copy">
-                <span className="config-field-label"><strong>{t('config.diagnostics.debug.title')}</strong><SettingsHelp label={t('config.diagnostics.debug.title')}>{t('config.diagnostics.debug.description')}</SettingsHelp></span>
-
-              </div>
-              <Switch title={t('config.diagnostics.debug.title')} checked={debugDraft} aria-label={t('config.diagnostics.debug.title')} disabled={diagnosticsControlsDisabled} onChange={(event) => {
+          <div className="config-diagnostics-list">
+            <div className="config-diagnostics-toggle-grid">
+              <div className={`config-diagnostics-setting${diagnosticsControlsDisabled ? ' is-disabled' : ''}`}>
+                <label className="config-diagnostics-setting-copy" htmlFor="config-diagnostics-debug">
+                  <span className="config-diagnostics-setting-icon" aria-hidden="true"><Bug size={17} /></span>
+                  <div>
+                    <strong>{t('config.diagnostics.debug.title')}</strong>
+                    <small>{t('config.diagnostics.debug.description')}</small>
+                  </div>
+                </label>
+                <Switch
+                  id="config-diagnostics-debug"
+                  title={t('config.diagnostics.debug.title')}
+                  checked={debugDraft}
+                  aria-label={t('config.diagnostics.debug.title')}
+                  disabled={diagnosticsControlsDisabled}
+                  onChange={(event) => {
                     setDebugDraft(event.currentTarget.checked);
                     markLoggingDraftDirty();
-                  }} />
-            </div>
-
-            <div className="config-diagnostics-setting">
-              <span className="config-diagnostics-setting-icon" aria-hidden="true"><Gauge size={18} /></span>
-              <div className="config-diagnostics-setting-copy">
-                <span className="config-field-label"><strong>{t('config.diagnostics.commercial.title')}</strong><SettingsHelp label={t('config.diagnostics.commercial.title')}>{t('config.diagnostics.commercial.description')} {t('config.diagnostics.commercial.warning')}</SettingsHelp></span>
-
+                  }}
+                />
               </div>
-              <Switch title={t('config.diagnostics.commercial.title')} checked={commercialModeDraft} aria-label={t('config.diagnostics.commercial.title')} disabled={diagnosticsControlsDisabled} onChange={(event) => {
+
+              <div className={`config-diagnostics-setting${diagnosticsControlsDisabled ? ' is-disabled' : ''}`}>
+                <label className="config-diagnostics-setting-copy" htmlFor="config-diagnostics-commercial">
+                  <span className="config-diagnostics-setting-icon" aria-hidden="true"><Gauge size={17} /></span>
+                  <div>
+                    <strong>{t('config.diagnostics.commercial.title')}</strong>
+                    <small>{t('config.diagnostics.commercial.description')} {t('config.diagnostics.commercial.warning')}</small>
+                  </div>
+                </label>
+                <Switch
+                  id="config-diagnostics-commercial"
+                  title={t('config.diagnostics.commercial.title')}
+                  checked={commercialModeDraft}
+                  aria-label={t('config.diagnostics.commercial.title')}
+                  disabled={diagnosticsControlsDisabled}
+                  onChange={(event) => {
                     setCommercialModeDraft(event.currentTarget.checked);
                     markLoggingDraftDirty();
-                  }} />
-            </div>
-
-            <div className="config-diagnostics-setting">
-              <span className="config-diagnostics-setting-icon" aria-hidden="true"><HardDrive size={18} /></span>
-              <div className="config-diagnostics-setting-copy">
-                <span className="config-field-label"><strong>{t('config.diagnostics.fileLogging.title')}</strong><SettingsHelp label={t('config.diagnostics.fileLogging.title')}>{t('config.diagnostics.fileLogging.description')}</SettingsHelp></span>
-
+                  }}
+                />
               </div>
-              <Switch title={t('config.diagnostics.fileLogging.title')} checked={loggingToFileDraft} aria-label={t('config.diagnostics.fileLogging.title')} disabled={diagnosticsControlsDisabled} onChange={(event) => {
+
+              <div className={`config-diagnostics-setting${diagnosticsControlsDisabled ? ' is-disabled' : ''}`}>
+                <label className="config-diagnostics-setting-copy" htmlFor="config-diagnostics-file-logging">
+                  <span className="config-diagnostics-setting-icon" aria-hidden="true"><HardDrive size={17} /></span>
+                  <div>
+                    <strong>{t('config.diagnostics.fileLogging.title')}</strong>
+                    <small>{t('config.diagnostics.fileLogging.description')}</small>
+                  </div>
+                </label>
+                <Switch
+                  id="config-diagnostics-file-logging"
+                  title={t('config.diagnostics.fileLogging.title')}
+                  checked={loggingToFileDraft}
+                  aria-label={t('config.diagnostics.fileLogging.title')}
+                  disabled={diagnosticsControlsDisabled}
+                  onChange={(event) => {
                     setLoggingToFileDraft(event.currentTarget.checked);
                     markLoggingDraftDirty();
-                  }} />
-            </div>
-
-            <div className="config-diagnostics-setting">
-              <span className="config-diagnostics-setting-icon" aria-hidden="true"><Database size={18} /></span>
-              <div className="config-diagnostics-setting-copy">
-                <span className="config-field-label"><strong>{t('config.diagnostics.usage.title')}</strong><SettingsHelp label={t('config.diagnostics.usage.title')}>{t('config.diagnostics.usage.description')}</SettingsHelp></span>
-
+                  }}
+                />
               </div>
-              <Switch title={t('config.diagnostics.usage.title')} checked={usageStatisticsDraft} aria-label={t('config.diagnostics.usage.title')} disabled={diagnosticsControlsDisabled} onChange={(event) => {
+
+              <div className={`config-diagnostics-setting${diagnosticsControlsDisabled ? ' is-disabled' : ''}`}>
+                <label className="config-diagnostics-setting-copy" htmlFor="config-diagnostics-usage">
+                  <span className="config-diagnostics-setting-icon" aria-hidden="true"><Database size={17} /></span>
+                  <div>
+                    <strong>{t('config.diagnostics.usage.title')}</strong>
+                    <small>{t('config.diagnostics.usage.description')}</small>
+                  </div>
+                </label>
+                <Switch
+                  id="config-diagnostics-usage"
+                  title={t('config.diagnostics.usage.title')}
+                  checked={usageStatisticsDraft}
+                  aria-label={t('config.diagnostics.usage.title')}
+                  disabled={diagnosticsControlsDisabled}
+                  onChange={(event) => {
                     setUsageStatisticsDraft(event.currentTarget.checked);
                     markLoggingDraftDirty();
-                  }} />
+                  }}
+                />
+              </div>
             </div>
-          </div>
 
-          <div className="config-diagnostics-fields">
-            <div className="config-diagnostics-field">
-              <span className="config-field-label"><label htmlFor="config-input-config-diagnostics-maxSize-title">{t('config.diagnostics.maxSize.title')}</label><SettingsHelp label={t('config.diagnostics.maxSize.title')}>{t('config.diagnostics.maxSize.hint')}</SettingsHelp></span>
-              <span className="config-input-with-unit">
-              <input
+            <div className="config-diagnostics-fields">
+              <div className={`config-diagnostics-field${diagnosticsControlsDisabled ? ' is-disabled' : ''}`}>
+                <label className="config-diagnostics-setting-copy" htmlFor="config-input-config-diagnostics-maxSize-title">
+                  <span className="config-diagnostics-setting-icon" aria-hidden="true"><FileText size={17} /></span>
+                  <div>
+                    <strong>{t('config.diagnostics.maxSize.title')}</strong>
+                    <small>{t('config.diagnostics.maxSize.hint')}</small>
+                  </div>
+                </label>
+                <input
                   id="config-input-config-diagnostics-maxSize-title"
-                className="config-dialog-text-input"
-                type="number"
-                min="0"
-                step="1"
-                value={logsMaxTotalSizeDraft}
-                disabled={diagnosticsControlsDisabled}
-                onChange={(event) => {
-                  setLogsMaxTotalSizeDraft(event.currentTarget.value);
-                  markLoggingDraftDirty();
-                }}
-              />
-              <span className="config-input-unit" aria-hidden="true">{t('config.unit.mb')}</span>
-              </span>
+                  className="config-network-input"
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={logsMaxTotalSizeDraft}
+                  disabled={diagnosticsControlsDisabled}
+                  onChange={(event) => {
+                    setLogsMaxTotalSizeDraft(event.currentTarget.value);
+                    markLoggingDraftDirty();
+                  }}
+                />
+              </div>
 
-            </div>
-            <div className="config-diagnostics-field">
-              <span className="config-field-label"><label htmlFor="config-input-config-diagnostics-errorFiles-title">{t('config.diagnostics.errorFiles.title')}</label><SettingsHelp label={t('config.diagnostics.errorFiles.title')}>{t('config.diagnostics.errorFiles.hint')}</SettingsHelp></span>
-              <span className="config-input-with-unit">
-              <input
+              <div className={`config-diagnostics-field${diagnosticsControlsDisabled ? ' is-disabled' : ''}`}>
+                <label className="config-diagnostics-setting-copy" htmlFor="config-input-config-diagnostics-errorFiles-title">
+                  <span className="config-diagnostics-setting-icon" aria-hidden="true"><AlertCircle size={17} /></span>
+                  <div>
+                    <strong>{t('config.diagnostics.errorFiles.title')}</strong>
+                    <small>{t('config.diagnostics.errorFiles.hint')}</small>
+                  </div>
+                </label>
+                <input
                   id="config-input-config-diagnostics-errorFiles-title"
-                className="config-dialog-text-input"
-                type="number"
-                min="0"
-                step="1"
-                value={errorLogsMaxFilesDraft}
-                disabled={diagnosticsControlsDisabled}
-                onChange={(event) => {
-                  setErrorLogsMaxFilesDraft(event.currentTarget.value);
-                  markLoggingDraftDirty();
-                }}
-              />
-              <span className="config-input-unit" aria-hidden="true">{t('config.unit.count')}</span>
-              </span>
+                  className="config-network-input"
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={errorLogsMaxFilesDraft}
+                  disabled={diagnosticsControlsDisabled}
+                  onChange={(event) => {
+                    setErrorLogsMaxFilesDraft(event.currentTarget.value);
+                    markLoggingDraftDirty();
+                  }}
+                />
+              </div>
 
-            </div>
-            <div className="config-diagnostics-field">
-              <span className="config-field-label"><label htmlFor="config-input-config-diagnostics-redisRetention-title">{t('config.diagnostics.redisRetention.title')}</label><SettingsHelp label={t('config.diagnostics.redisRetention.title')}>{t('config.diagnostics.redisRetention.hint')}</SettingsHelp></span>
-              <span className="config-input-with-unit">
-              <input
+              <div className={`config-diagnostics-field${diagnosticsControlsDisabled ? ' is-disabled' : ''}`}>
+                <label className="config-diagnostics-setting-copy" htmlFor="config-input-config-diagnostics-redisRetention-title">
+                  <span className="config-diagnostics-setting-icon" aria-hidden="true"><Clock3 size={17} /></span>
+                  <div>
+                    <strong>{t('config.diagnostics.redisRetention.title')}</strong>
+                    <small>{t('config.diagnostics.redisRetention.hint')}</small>
+                  </div>
+                </label>
+                <input
                   id="config-input-config-diagnostics-redisRetention-title"
-                className="config-dialog-text-input"
-                type="number"
-                min="1"
-                max="3600"
-                step="1"
-                value={redisUsageRetentionDraft}
-                disabled={diagnosticsControlsDisabled}
-                onChange={(event) => {
-                  setRedisUsageRetentionDraft(event.currentTarget.value);
-                  markLoggingDraftDirty();
-                }}
-              />
-              <span className="config-input-unit" aria-hidden="true">{t('config.unit.seconds')} · 1–3600</span>
-              </span>
-
+                  className="config-network-input"
+                  type="number"
+                  min="1"
+                  max="3600"
+                  step="1"
+                  value={redisUsageRetentionDraft}
+                  disabled={diagnosticsControlsDisabled}
+                  onChange={(event) => {
+                    setRedisUsageRetentionDraft(event.currentTarget.value);
+                    markLoggingDraftDirty();
+                  }}
+                />
+              </div>
             </div>
           </div>
 
           {settings && commercialModeDraft !== settings.commercialMode ? (
-            <Notice tone="warn" icon={<AlertCircle size={16} />}>{st('restart')}</Notice>
+            <Notice tone="warn" icon={<AlertCircle size={16} />}>{st(external ? 'externalRestart' : 'restart')}</Notice>
           ) : null}
 
-          <div className="config-diagnostics-footer">
-            <span className={`config-form-message ${loggingError ? 'error' : ''}`} role="alert">
-              {loggingError || ' '}
+          {loggingError ? (
+            <span className="config-form-message error" role="alert">
+              {loggingError}
             </span>
-            <div className="config-diagnostics-actions"><span className="config-card-status" role="status">{loggingSettingsDirty ? st('dirty') : ''}</span>
-              <button
-                type="button"
-                className="secondary-button compact-button"
-                disabled={diagnosticsControlsDisabled}
-                onClick={() => void handleOpenCoreLogsDirectory()}
-              >
-                <FolderOpen size={16} aria-hidden="true" />
-                {t('config.diagnostics.openLogs')}
-              </button>
-              <button
-                type="button"
-                className="secondary-button compact-button"
-                disabled={diagnosticsControlsDisabled || !loggingSettingsDirty}
-                onClick={discardLoggingDraft}
-              >
-                {t('agents.catalog.discard')}
-              </button>
-              <button
-                type="button"
-                className="primary-button compact-button"
-                disabled={diagnosticsControlsDisabled || !loggingSettingsDirty}
-                onClick={() => void saveCoreLoggingSettings()}
-              >
-                <Check size={16} aria-hidden="true" />
-                {loggingSettingsBusy ? t('common.saving') : t('common.save')}
-              </button>
-            </div>
-            {renderFeedback(loggingFeedback)}
-          </div></>)}
+          ) : null}
+          {renderFeedback(loggingFeedback, !searching && activeSubpage === 'diagnostics')}</>)}
         </section>
 <section id="config-native-software" tabIndex={-1} hidden={searching || activeSubpage !== 'software'} className="panel surface-card config-software-panel">
             <div className="config-panel-heading">
               <div className="config-heading-title">
                 <Settings2 size={18} aria-hidden="true" />
-                <h2>{t('config.software.title')}</h2>
+                <h2>{softwareTabTitle}</h2>
               </div>
               <div className="config-heading-actions">
-                {busyAction === 'software' ? (
+                {softwareSettingsLoading && softwareSettings === null ? (
+                  <span className="config-inline-status">{t('common.loading')}</span>
+                ) : softwareSettings === null ? (
+                  <span className="state-pill">{t('common.unavailable')}</span>
+                ) : softwareSaving ? (
                   <span className="state-pill">{t('common.saving')}</span>
-                ) : softwareStatusLabel ? (
-                  <span className={`state-pill ${softwareStatusIsSaved ? 'success' : ''}`}>
-                    {softwareStatusLabel}
-                  </span>
-                ) : null}
-
+                ) : softwareSavedStatusVisible ? (
+                  <span className="state-pill success">{t('config.network.saved')}</span>
+                ) : (
+                  <span className="config-inline-status">{st('automatic')}</span>
+                )}
               </div>
             </div>
-            {nativeSectionsPending ? renderNativeSkeleton() : (<>
+            {softwareSettingsLoading && softwareSettings === null ? renderNativeSkeleton() : (<>
             <div className="config-software-content">
-              {renderFeedback(softwareFeedback)}
               <div className="config-software-settings-list">
-                <div className="config-software-setting-row">
-                  <div className="config-software-setting-copy">
+                <div className={`config-software-setting-row${softwareControlsDisabled ? ' is-disabled' : ''}`}>
+                  <label className="config-software-setting-copy" htmlFor="config-software-autostart">
                     <span className="config-software-setting-icon" aria-hidden="true">
-                      <Clock3 size={18} />
+                      <Clock3 size={17} />
                     </span>
                     <div>
                       <strong>{t('config.software.autostart')}</strong>
+                      <small>{t('config.software.autostartDescription')}</small>
                     </div>
-                  </div>
-                  <Switch title={t('config.software.autostart')} aria-label={t('config.software.autostart')} checked={softwareAutostartDraft} disabled={softwareControlsDisabled} onChange={(event) => {
-                        setSoftwareSavedStatusVisible(false);
-                        setSoftwareAutostartDraft(event.currentTarget.checked);
-                      }} />
+                  </label>
+                  <Switch
+                    id="config-software-autostart"
+                    title={t('config.software.autostart')}
+                    aria-label={t('config.software.autostart')}
+                    checked={softwareValues.autostartEnabled}
+                    disabled={softwareControlsDisabled}
+                    onChange={(event) => updateSoftwarePreference({ autostartEnabled: event.currentTarget.checked })}
+                  />
                 </div>
-                <div className="config-software-setting-row">
-                  <div className="config-software-setting-copy">
+                <div className={`config-software-setting-row${external || softwareControlsDisabled ? ' is-disabled' : ''}`}>
+                  <label className="config-software-setting-copy" htmlFor="config-software-start-core">
                     <span className="config-software-setting-icon" aria-hidden="true">
-                      <Power size={18} />
+                      <Power size={17} />
                     </span>
                     <div>
                       <strong>{t('config.software.startCoreOnLaunch')}</strong>
+                      <small>{external ? st('externalUnsupported') : t('config.software.startCoreOnLaunchDescription')}</small>
                     </div>
-                  </div>
-                  <Switch title={t('config.software.startCoreOnLaunch')} aria-label={t('config.software.startCoreOnLaunch')} checked={softwareStartCoreDraft} disabled={softwareControlsDisabled} onChange={(event) => {
-                        setSoftwareSavedStatusVisible(false);
-                        setSoftwareStartCoreDraft(event.currentTarget.checked);
-                      }} />
+                  </label>
+                  <Switch
+                    id="config-software-start-core"
+                    title={t('config.software.startCoreOnLaunch')}
+                    aria-label={t('config.software.startCoreOnLaunch')}
+                    checked={softwareValues.startCoreOnLaunch}
+                    disabled={external || softwareControlsDisabled}
+                    onChange={(event) => updateSoftwarePreference({ startCoreOnLaunch: event.currentTarget.checked })}
+                  />
                 </div>
-                <div className="config-software-setting-row">
-                  <div className="config-software-setting-copy">
+                <div className={`config-software-setting-row${softwareControlsDisabled ? ' is-disabled' : ''}`}>
+                  <label className="config-software-setting-copy" htmlFor="config-software-silent-start">
                     <span className="config-software-setting-icon" aria-hidden="true">
-                      <EyeOff size={18} />
+                      <EyeOff size={17} />
                     </span>
                     <div>
-                      <span className="config-field-label"><strong>{t('config.software.silentStart')}</strong><SettingsHelp label={t('config.software.silentStart')}>{t('config.software.silentStartDescription')}</SettingsHelp></span>
-
+                      <strong>{t('config.software.silentStart')}</strong>
+                      <small>{t('config.software.silentStartDescription')}</small>
                     </div>
-                  </div>
-                  <Switch title={t('config.software.silentStart')} aria-label={t('config.software.silentStart')} checked={softwareSilentStartDraft} disabled={softwareControlsDisabled} onChange={(event) => {
-                        setSoftwareSavedStatusVisible(false);
-                        setSoftwareSilentStartDraft(event.currentTarget.checked);
-                      }} />
+                  </label>
+                  <Switch
+                    id="config-software-silent-start"
+                    title={t('config.software.silentStart')}
+                    aria-label={t('config.software.silentStart')}
+                    checked={softwareValues.silentStartEnabled}
+                    disabled={softwareControlsDisabled}
+                    onChange={(event) => updateSoftwarePreference({ silentStartEnabled: event.currentTarget.checked })}
+                  />
                 </div>
-                <div className="config-software-setting-row config-software-close-row">
-                  <div className="config-software-setting-copy">
+                <div className={`config-software-setting-row config-software-close-row${softwareControlsDisabled ? ' is-disabled' : ''}`}>
+                  <label className="config-software-setting-copy" htmlFor="config-software-default-terminal">
                     <span className="config-software-setting-icon" aria-hidden="true">
-                      <Terminal size={18} />
+                      <Terminal size={17} />
                     </span>
                     <div>
                       <strong>{t('config.software.defaultTerminal')}</strong>
+                      <small>{t('config.software.defaultTerminalDescription')}</small>
                     </div>
-                  </div>
-                  <label className="config-software-select">
-                    <span className="sr-only">{t('config.software.defaultTerminal')}</span>
+                  </label>
+                  <div className="config-software-select">
                     <Select
+                      id="config-software-default-terminal"
+                      aria-label={t('config.software.defaultTerminal')}
                       className="config-network-input"
-                      value={softwareDefaultTerminalDraft}
+                      value={softwareValues.defaultTerminal}
                       disabled={softwareControlsDisabled}
-                      onChange={(event) => {
-                        setSoftwareSavedStatusVisible(false);
-                        setSoftwareDefaultTerminalDraft(event.currentTarget.value);
-                      }}
+                      onChange={(event) => updateSoftwarePreference({ defaultTerminal: event.currentTarget.value })}
                     >
                       {(softwareSettings?.availableTerminals ?? []).map((terminal) => (
                         <option value={terminal.id} key={terminal.id}>
@@ -2666,61 +3047,101 @@ export function ConfigPanelPage() {
                         </option>
                       ))}
                     </Select>
-                  </label>
+                  </div>
                 </div>
-                <div className="config-software-setting-row config-software-close-row">
-                  <div className="config-software-setting-copy">
+                <div className={`config-software-setting-row config-software-close-row${softwareControlsDisabled ? ' is-disabled' : ''}`}>
+                  <label className="config-software-setting-copy" htmlFor="config-software-close-behavior">
                     <span className="config-software-setting-icon" aria-hidden="true">
-                      <X size={18} />
+                      <X size={17} />
                     </span>
                     <div>
                       <strong>{t('config.software.closeBehavior')}</strong>
+                      <small>{t('config.software.closeBehaviorDescription')}</small>
                     </div>
-                  </div>
-                  <label className="config-software-select">
-                    <span className="sr-only">{t('config.software.closeBehavior')}</span>
+                  </label>
+                  <div className="config-software-select">
                     <Select
+                      id="config-software-close-behavior"
+                      aria-label={t('config.software.closeBehavior')}
                       className="config-network-input"
-                      value={softwareCloseBehaviorDraft}
+                      value={softwareValues.closeBehavior}
                       disabled={softwareControlsDisabled}
-                      onChange={(event) => {
-                        setSoftwareSavedStatusVisible(false);
-                        setSoftwareCloseBehaviorDraft(event.currentTarget.value as CloseBehavior);
-                      }}
+                      onChange={(event) => updateSoftwarePreference({ closeBehavior: event.currentTarget.value as CloseBehavior })}
                     >
                       <option value="ask">{t('config.software.behavior.ask')}</option>
                       <option value="minimize-to-tray">{t('config.software.behavior.minimize')}</option>
                       <option value="exit">{t('config.software.behavior.exit')}</option>
                     </Select>
-                  </label>
+                  </div>
                 </div>
               </div>
             </div>
-
-          <div className="config-settings-save-row"><button
-                  type="button"
-                  className="secondary-button compact-button"
-                  disabled={softwareControlsDisabled || !softwareSettingsDirty}
-                  onClick={discardSoftwareDraft}
-                >
-                  {t('agents.catalog.discard')}
-                </button><button
-                  type="button"
-                  className="primary-button compact-button"
-                  disabled={softwareControlsDisabled || !softwareSettingsDirty}
-                  onClick={() => void saveSoftwareSettings()}
-                >
-                  <Check size={16} aria-hidden="true" />
-                  {busyAction === 'software' ? t('common.saving') : t('common.save')}
-                </button></div></>)}
+            {renderFeedback(softwareFeedback, !searching && activeSubpage === 'software')}</>)}
         </section>
           </div>
-          <div id="config-template-panel" hidden={searching || templateGroups.length === 0}><TemplateConfigSection groups={allSettingsTemplateGroups} visibleGroups={templateGroups.map(group => group.id)} onDirtyGroupsChange={setDirtyTemplateGroups} /></div>
+          <div id="config-template-panel" hidden={searching || templateGroups.length === 0}><TemplateConfigSection ref={templateSectionRef} groups={allSettingsTemplateGroups} visibleGroups={templateGroups.map(group => group.id)} onDirtyGroupsChange={setDirtyTemplateGroups} /></div>
           <div className="surface-card" id="config-native-aliases" tabIndex={-1} role="region" aria-label={t('app.nav.thinkingAliases')} hidden={searching || activeSubpage !== 'aliases'}>{aliasesVisited ? <ThinkingAliasesPage embedded /> : null}</div>
-          <div className="surface-card" id="config-native-sensitive-words" tabIndex={-1} role="region" aria-label={t('config.sensitiveWords.title')} hidden={searching || activeSubpage !== 'sensitiveWords'}>{sensitiveWordsVisited ? <SensitiveWordsPage active={!searching && activeSubpage === 'sensitiveWords'} onDirtyChange={setSensitiveWordsDirty} /> : null}</div>
+          <div className="surface-card" id="config-native-sensitive-words" tabIndex={-1} role="region" aria-label={t('config.sensitiveWords.title')} hidden={searching || activeSubpage !== 'sensitiveWords'}>{sensitiveWordsVisited ? <SensitiveWordsPage ref={sensitiveWordsRef} active={!searching && activeSubpage === 'sensitiveWords'} onDirtyChange={setSensitiveWordsDirty} /> : null}</div>
         </div>
+        {dirtyDescriptors.length > 0 ? (
+          <div className="surface-card config-sticky-save-bar" role="region" aria-label={st('dirty')}>
+            <div className="config-sticky-save-summary">
+              <span className="config-nav-dirty" aria-hidden="true" />
+              <strong>
+                {locale === 'en'
+                  ? `${dirtyDescriptors.length} unsaved ${dirtyDescriptors.length === 1 ? 'section' : 'sections'}`
+                  : locale === 'ja'
+                    ? `${dirtyDescriptors.length} 件の未保存変更`
+                    : `${dirtyDescriptors.length} 项分组有未保存修改`}
+              </strong>
+              <div className="config-sticky-save-chips">
+                {dirtyDescriptors.map((item) => (
+                  <button
+                    type="button"
+                    key={item.key}
+                    className="config-sticky-save-chip"
+                    onClick={() => navigateToSetting({ category: item.category, target: item.target })}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="config-sticky-save-actions">
+              <button
+                type="button"
+                className="secondary-button compact-button"
+                disabled={anySaveBusy}
+                onClick={discardAllDirty}
+              >
+                {dirtyDescriptors.length > 1
+                  ? (locale === 'en' ? 'Discard all' : locale === 'ja' ? 'すべて破棄' : '全部放弃')
+                  : t('agents.catalog.discard')}
+              </button>
+              <button
+                type="button"
+                className="primary-button compact-button config-save-all-button"
+                disabled={anySaveBusy}
+                onClick={() => void saveAllDirty()}
+              >
+                <Check size={15} aria-hidden="true" />
+                <span>
+                  {anySaveBusy
+                    ? t('common.saving')
+                    : dirtyDescriptors.length > 1
+                      ? (locale === 'en' ? 'Save all changes' : locale === 'ja' ? 'すべて保存' : '一键全部保存')
+                      : t('common.save')}
+                </span>
+                <kbd className="config-save-shortcut" aria-hidden="true">Ctrl+S</kbd>
+              </button>
+            </div>
+          </div>
+        ) : null}
       </div>
 
+      {external && serverLogs !== null && <Dialog title={st('readLogs')} onClose={() => setServerLogs(null)}>
+        <pre style={{ maxHeight: '60vh', overflow: 'auto', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{serverLogs.join('\n') || st('emptyLogs')}</pre>
+      </Dialog>}
       {addDialogOpen ? (
         <Dialog
           as="form"
@@ -2749,10 +3170,11 @@ export function ConfigPanelPage() {
             </button>
           </div>
 
-          <label className="config-dialog-field">
-            <span>{t('config.keys.label')}</span>
+          <div className="config-dialog-field">
+            <label htmlFor="config-dialog-api-key-input">{t('config.keys.label')}</label>
             <div className="config-secret-input">
               <input
+                id="config-dialog-api-key-input"
                 autoFocus
                 type={showApiKey ? 'text' : 'password'}
                 value={newApiKey}
@@ -2766,20 +3188,21 @@ export function ConfigPanelPage() {
               />
               <button
                 type="button"
-                className="icon-button quiet"
+                className={`icon-button quiet config-secret-toggle${showApiKey ? ' is-revealed' : ''}`}
                 onClick={() => setShowApiKey((visible) => !visible)}
                 disabled={keyMutationBusy}
+                aria-pressed={showApiKey}
                 title={showApiKey ? t('config.keys.hide') : t('config.keys.show')}
                 aria-label={showApiKey ? t('config.keys.hide') : t('config.keys.show')}
               >
                 {showApiKey ? (
-                  <EyeOff size={17} aria-hidden="true" />
+                  <Eye size={17} strokeWidth={1.75} aria-hidden="true" />
                 ) : (
-                  <Eye size={17} aria-hidden="true" />
+                  <EyeOff size={17} strokeWidth={1.75} aria-hidden="true" />
                 )}
               </button>
             </div>
-          </label>
+          </div>
 
           <label className="config-dialog-field">
             <span>{t('config.keys.remark')}</span>
@@ -2874,7 +3297,7 @@ function maskApiKey(apiKey: string) {
     return '';
   }
   const visible = value.length < 4 ? 1 : 2;
-  return `${value.slice(0, visible)}${'*'.repeat(Math.max(6, 10 - visible * 2))}${value.slice(-visible)}`;
+  return `${value.slice(0, visible)}${'•'.repeat(Math.max(6, 10 - visible * 2))}${value.slice(-visible)}`;
 }
 
 function routingStrategyLabel(strategy: string | undefined, t: ReturnType<typeof useI18n>['t'], locale: ReturnType<typeof useI18n>['locale']) {

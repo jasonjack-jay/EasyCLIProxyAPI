@@ -270,6 +270,7 @@ pub(crate) fn managed_core_tls_enabled() -> bool {
 }
 
 pub(crate) fn managed_core_loopback_origin(port: u16) -> String {
+    if let Ok(origin) = crate::remote_cpa::AGENT_ORIGIN.try_with(Clone::clone) { return origin; }
     #[cfg(test)]
     {
         core_loopback_origin(port, false)
@@ -1678,11 +1679,18 @@ pub(crate) fn load_or_create_gui_config() -> Result<GuiConfigFile, String> {
     } else {
         None
     };
-    let recovered_secret = recover_management_secret(
-        &config.management_secret_key,
-        saved_management_secret,
-        installed_management_secret.as_deref(),
-    );
+    let recovered_secret = if config.management_secret_key_unmanaged
+        && saved_management_secret == Some("")
+        && installed_management_secret.as_deref().is_some_and(is_hashed_management_secret_key)
+    {
+        String::new()
+    } else {
+        recover_management_secret(
+            &config.management_secret_key,
+            saved_management_secret,
+            installed_management_secret.as_deref(),
+        )
+    };
     let management_secret_rotated = recovered_secret != config.management_secret_key;
     config.management_secret_key = recovered_secret;
     changed |= management_secret_rotated;
@@ -1727,6 +1735,7 @@ pub(crate) fn apply_core_settings_to_gui_config(
         .filter(|secret_key| !is_hashed_management_secret_key(secret_key))
     {
         config.management_secret_key = secret_key.to_string();
+        config.management_secret_key_unmanaged = false;
     }
     config.debug = core_settings.debug;
     config.commercial_mode = core_settings.commercial_mode;
@@ -2312,6 +2321,11 @@ pub(crate) fn write_gui_config_to_path(
         .and_then(|content| content.parse::<Document>().ok())
         .unwrap_or_default();
     let root = document.as_table_mut();
+    if config.management_secret_key_unmanaged {
+        root.insert("management-secret-key-unmanaged", value(true));
+    } else {
+        root.remove("management-secret-key-unmanaged");
+    }
     crate::auto_update::write_settings(root, &config.auto_update)?;
     if config.usage_statistics_disabled == Some(true) {
         set_codex_table_item(root, "usage_statistics_disabled", value(true));
@@ -2364,6 +2378,7 @@ pub(crate) fn write_gui_config_to_path(
         ("proxy-url", value(config.proxy_url.as_str())),
         ("proxy-override", value(config.proxy_override)),
         ("download-source", value(config.download_source.as_str())),
+        ("update-channel", value(config.update_channel.as_str())),
         (
             "prefer-gitcode-downloads",
             value(config.prefer_gitcode_downloads),

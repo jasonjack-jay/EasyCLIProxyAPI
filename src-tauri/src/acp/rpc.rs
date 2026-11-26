@@ -13,12 +13,80 @@ fn request_timeout(method: &str) -> Duration {
     })
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Rejection {
+    InvalidRequest,
+    Authentication,
+    Permission,
+    Quota,
+    Overloaded,
+    Timeout,
+    Unknown,
+}
+
+#[derive(Debug)]
+pub(super) enum RpcFailure {
+    Local(String),
+    Remote { kind: Rejection, message: String },
+}
+
+impl From<String> for RpcFailure {
+    fn from(error: String) -> Self {
+        Self::Local(error)
+    }
+}
+impl From<&str> for RpcFailure {
+    fn from(error: &str) -> Self {
+        Self::Local(error.into())
+    }
+}
+impl RpcFailure {
+    fn remote(error: &Value) -> Self {
+        // Only the matched JSON-RPC error envelope can supply a machine code.
+        // The error message, assistant text, and progress updates are not codes.
+        let data = &error["data"];
+        let kind = match data["status"]
+            .as_str()
+            .or_else(|| data["error"]["status"].as_str())
+        {
+            Some("INVALID_ARGUMENT") => Rejection::InvalidRequest,
+            Some("UNAUTHENTICATED") => Rejection::Authentication,
+            Some("PERMISSION_DENIED") => Rejection::Permission,
+            Some("RESOURCE_EXHAUSTED") => Rejection::Quota,
+            Some("UNAVAILABLE") => Rejection::Overloaded,
+            Some("DEADLINE_EXCEEDED") => Rejection::Timeout,
+            // Unknown status must not be turned into a known rejection by text.
+            Some(_) => Rejection::Unknown,
+            None => match error["code"].as_i64() {
+                // ACP's protocol-defined authentication error.
+                Some(-32000) => Rejection::Authentication,
+                Some(-32602) => Rejection::InvalidRequest,
+                _ => Rejection::Unknown,
+            },
+        };
+        Self::Remote {
+            kind,
+            message: error["message"]
+                .as_str()
+                .unwrap_or("ACP request failed")
+                .into(),
+        }
+    }
+
+    fn local_message(self) -> String {
+        match self {
+            Self::Local(message) | Self::Remote { message, .. } => message,
+        }
+    }
+}
+
 pub(super) struct Client {
     child: crate::CoreChild,
     input: mpsc::SyncSender<WriteRequest>,
     output: mpsc::Receiver<Result<Value, String>>,
     next_id: u64,
     supports_logout: bool,
+    supports_prompt_images: bool,
     system_prompt: SystemPromptSupport,
     api_tools: Vec<String>,
     started: std::time::SystemTime,
@@ -34,17 +102,61 @@ enum SystemPromptSupport {
     Antigravity,
 }
 
-pub(super) fn command(executable: &Path, profile: &Path, proxy: &str) -> Command {
-    let mut command = Command::new(executable);
+pub(super) fn command(executable: &Path, profile: &Path, proxy: &str) -> Result<Command, String> {
+    command_with_args(executable, profile, proxy, &[])
+}
+
+pub(super) fn command_with_args(
+    executable: &Path,
+    profile: &Path,
+    proxy: &str,
+    extra: &[&str],
+) -> Result<Command, String> {
+    let isolated = super::accounts::is_isolated_home(profile);
+    let canonical;
+    let profile = if isolated {
+        canonical = super::accounts::checked_isolated_home(profile)?;
+        canonical.as_path()
+    } else {
+        profile
+    };
+    let mut args = vec![std::ffi::OsString::from("acp")];
+    // Standalone help and sign-in use the documented bare subcommand. Their
+    // isolated HOME points to the same default storage as the runtime does.
+    if extra.is_empty() {
+        args.extend([
+            "--gemini-dir".into(),
+            profile.join(".gemini").into_os_string(),
+        ]);
+        args.extend(
+            [
+                "--app-data-dir",
+                "antigravity-cli",
+                "--disable-telemetry",
+                "--include-default-customizations=false",
+            ]
+            .map(std::ffi::OsString::from),
+        );
+    }
+    args.extend(extra.iter().map(std::ffi::OsString::from));
+    #[cfg(windows)]
+    let mut command = {
+        let arguments = args
+            .into_iter()
+            .map(|arg| {
+                arg.into_string()
+                    .map_err(|_| "ACP argument is not valid Unicode")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::windows_literal_cli_command(executable, &arguments)?
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut command = Command::new(executable);
+        command.args(args);
+        command
+    };
     command
-        .args(["acp", "--gemini-dir"])
-        .arg(profile.join(".gemini"))
-        .args([
-            "--app-data-dir",
-            "antigravity-cli",
-            "--disable-telemetry",
-            "--include-default-customizations=false",
-        ])
         .current_dir(profile.join("workspace"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -52,17 +164,35 @@ pub(super) fn command(executable: &Path, profile: &Path, proxy: &str) -> Command
     // Never inherit the managed Antigravity-client route back into CPA.
     for (name, _) in std::env::vars_os() {
         let name = name.to_string_lossy();
+        let normalized = if cfg!(windows) {
+            name.to_ascii_uppercase()
+        } else {
+            name.to_string()
+        };
         if ["GEMINI_", "GOOGLE_", "GCLOUD_", "VERTEX_", "CLIPROXYAPI_"]
             .iter()
-            .any(|prefix| name.starts_with(prefix))
+            .any(|prefix| normalized.starts_with(prefix))
         {
             command.env_remove(name.as_ref());
         }
     }
     command.env("GEMINI_CLI_HOME", profile);
+    if isolated {
+        command
+            .env("HOME", profile)
+            .env("SSH_CONNECTION", "127.0.0.1 0 127.0.0.1 0")
+            .env("XDG_CONFIG_HOME", profile.join(".config"))
+            .env("XDG_DATA_HOME", profile.join(".local/share"))
+            .env("XDG_CACHE_HOME", profile.join(".cache"));
+        #[cfg(windows)]
+        command
+            .env("USERPROFILE", profile)
+            .env("APPDATA", profile.join("AppData/Roaming"))
+            .env("LOCALAPPDATA", profile.join("AppData/Local"));
+    }
     crate::configure_networked_command(&mut command, proxy);
     crate::configure_background_command(&mut command);
-    command
+    Ok(command)
 }
 
 impl Client {
@@ -70,6 +200,7 @@ impl Client {
     // official login-result log, never another profile or credential storage.
     pub(super) fn account_email(&self, profile: &Path) -> Option<String> {
         let directory = profile.join(".gemini/antigravity-cli/log");
+        super::accounts::safe_path(&directory).ok()?;
         let suffix = format!("-{}.log", self.child.id());
         let path = std::fs::read_dir(directory)
             .ok()?
@@ -79,6 +210,7 @@ impl Client {
                 let name = name.to_string_lossy();
                 name.starts_with("acp-server-")
                     && name.ends_with(&suffix)
+                    && entry.file_type().is_ok_and(|kind| kind.is_file())
                     && entry
                         .metadata()
                         .ok()
@@ -87,6 +219,7 @@ impl Client {
             })
             .max_by_key(|entry| entry.file_name())?
             .path();
+        super::accounts::safe_path(&path).ok()?;
         let mut file = std::fs::File::open(path).ok()?;
         let length = file.metadata().ok()?.len();
         file.seek(SeekFrom::Start(length.saturating_sub(512 * 1024)))
@@ -98,7 +231,7 @@ impl Client {
 
     pub(super) fn spawn(executable: &Path, profile: &Path, proxy: &str) -> Result<Self, String> {
         std::fs::create_dir_all(profile.join("workspace")).map_err(|e| e.to_string())?;
-        Self::spawn_command(command(executable, profile, proxy))
+        Self::spawn_command(command(executable, profile, proxy)?)
     }
 
     pub(super) fn spawn_command(command: Command) -> Result<Self, String> {
@@ -158,6 +291,7 @@ impl Client {
             output,
             next_id: 0,
             supports_logout: false,
+            supports_prompt_images: false,
             system_prompt: SystemPromptSupport::default(),
             api_tools: Vec::new(),
             started,
@@ -201,19 +335,25 @@ impl Client {
         F: FnMut(Value),
     {
         self.call_with_timeout(method, params, cancel, request_timeout(method), update)
+            .map_err(RpcFailure::local_message)
     }
 
     pub(super) fn agent_prompt<F: FnMut(Value)>(
         &mut self,
         params: Value,
         cancel: &Arc<std::sync::atomic::AtomicBool>,
+        waits_for_tools: bool,
         update: F,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, RpcFailure> {
         self.call_with_timeout(
             "session/prompt",
             params,
             cancel,
-            Duration::from_secs(720),
+            if waits_for_tools {
+                Duration::from_secs(720)
+            } else {
+                request_timeout("session/prompt")
+            },
             update,
         )
     }
@@ -225,16 +365,17 @@ impl Client {
         cancel: &Arc<std::sync::atomic::AtomicBool>,
         timeout: Duration,
         update: F,
-    ) -> Result<Value, String>
+    ) -> Result<Value, RpcFailure>
     where
         F: FnMut(Value),
     {
         let result = self.receive_response(method, params, cancel, timeout, update);
         // A timed-out/cancelled stream cannot be reused safely. Stop the owned
         // process before releasing the operation slot, even if the CLI is silent.
-        if let Err(error) = &result {
-            crate::terminate_child(&mut self.child)
-                .map_err(|cleanup| format!("{error}; failed to stop ACP process: {cleanup}"))?;
+        if result.is_err() {
+            if let Err(cleanup) = crate::terminate_child(&mut self.child) {
+                return Err(format!("Failed to stop ACP process: {cleanup}").into());
+            }
         }
         result
     }
@@ -246,7 +387,7 @@ impl Client {
         cancel: &Arc<std::sync::atomic::AtomicBool>,
         timeout: Duration,
         mut update: F,
-    ) -> Result<Value, String>
+    ) -> Result<Value, RpcFailure>
     where
         F: FnMut(Value),
     {
@@ -254,6 +395,10 @@ impl Client {
             return Err("ACP request cancelled".into());
         }
         let deadline = Instant::now() + timeout;
+        let session = params["sessionId"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         self.next_id += 1;
         let id = self.next_id;
         self.send(
@@ -270,7 +415,8 @@ impl Client {
                 return Err(format!(
                     "ACP {method} timed out after {} seconds",
                     timeout.as_secs_f64()
-                ));
+                )
+                .into());
             }
             let message = match self
                 .output
@@ -281,21 +427,25 @@ impl Client {
                 Err(_) => return Err("ACP output disconnected".into()),
             };
             if message.get("method").is_some() {
+                let current_session = session
+                    .as_deref()
+                    .is_some_and(|id| message["params"]["sessionId"].as_str() == Some(id));
                 if let Some(request_id) = message.get("id") {
                     let response = if message["method"] == "session/request_permission" {
                         let tool = &message["params"]["toolCall"];
-                        let permitted = self.api_tools.iter().any(|name| {
-                            [tool["name"].as_str(), tool["title"].as_str()]
-                                .into_iter()
-                                .flatten()
-                                .any(|label| {
-                                    label == name
-                                        || label == format!("api_client/{name}")
-                                        || label == format!("api_client__{name}")
-                                        || label == format!("mcp_api_client_{name}")
-                                        || label == format!("mcp__api_client__{name}")
-                                })
-                        });
+                        let permitted = current_session
+                            && method == "session/prompt"
+                            && self.api_tools.iter().any(|name| {
+                                [tool["name"].as_str(), tool["title"].as_str()]
+                                    .into_iter()
+                                    .flatten()
+                                    .any(|label| {
+                                        label == format!("api_client/{name}")
+                                            || label == format!("api_client__{name}")
+                                            || label == format!("mcp_api_client_{name}")
+                                            || label == format!("mcp__api_client__{name}")
+                                    })
+                            });
                         let option = message["params"]["options"].as_array().and_then(|options| {
                             options
                                 .iter()
@@ -307,15 +457,12 @@ impl Client {
                         json!({"jsonrpc":"2.0", "id":request_id, "error":{"code":-32601,"message":"ACP client capability disabled"}})
                     };
                     self.send(response, cancel, deadline)?;
-                } else if message["method"] == "session/update" {
+                } else if current_session && message["method"] == "session/update" {
                     update(message["params"]["update"].clone());
                 }
             } else if message["id"] == id {
                 if let Some(error) = message.get("error") {
-                    return Err(error["message"]
-                        .as_str()
-                        .unwrap_or("ACP request failed")
-                        .to_string());
+                    return Err(RpcFailure::remote(error));
                 }
                 return Ok(message["result"].clone());
             }
@@ -326,11 +473,33 @@ impl Client {
         &mut self,
         cancel: &Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<(), String> {
-        let response = self.call("initialize", json!({"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"EasyCLIProxyAPI","version":env!("CARGO_PKG_VERSION")}}), cancel, |_| {})?;
+        self.initialize_with_auth(cancel, false).map(|_| ())
+    }
+
+    pub(super) fn initialize_manual(
+        &mut self,
+        cancel: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<super::manual_auth::LoginAdvertisement, String> {
+        let response = self.initialize_with_auth(cancel, true)?;
+        Ok(super::manual_auth::TerminalLogin::advertised(&response))
+    }
+
+    fn initialize_with_auth(
+        &mut self,
+        cancel: &Arc<std::sync::atomic::AtomicBool>,
+        manual: bool,
+    ) -> Result<Value, String> {
+        let capabilities = if manual {
+            json!({"auth":{"terminal":true}})
+        } else {
+            json!({})
+        };
+        let response = self.call("initialize", json!({"protocolVersion":1,"clientCapabilities":capabilities,"clientInfo":{"name":"EasyCLIProxyAPI","version":env!("CARGO_PKG_VERSION")}}), cancel, |_| {})?;
         self.supports_logout = response["agentCapabilities"]["auth"]
             .get("logout")
-            .is_some_and(|value| !value.is_null());
+            .is_some_and(|value| value.is_object() || value == true);
         let capabilities = &response["agentCapabilities"];
+        self.supports_prompt_images = capabilities["promptCapabilities"]["image"] == true;
         self.system_prompt = if capabilities["sessionCapabilities"]
             .get("systemPrompt")
             .is_some_and(Value::is_object)
@@ -341,7 +510,11 @@ impl Client {
         } else {
             SystemPromptSupport::Unavailable
         };
-        Ok(())
+        Ok(response)
+    }
+
+    pub(super) fn supports_prompt_images(&self) -> bool {
+        self.supports_prompt_images
     }
 
     pub(super) fn logout(
@@ -349,7 +522,7 @@ impl Client {
         cancel: &Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<(), String> {
         if !self.supports_logout {
-            return Err("This official CLI does not support ACP logout; update Antigravity CLI to switch accounts".into());
+            return Err("This official CLI does not support ACP logout. Update Antigravity CLI to sign out or authorize again; alternatively remove this app's local account record.".into());
         }
         self.call("logout", json!({}), cancel, |_| {})?;
         Ok(())
@@ -360,7 +533,7 @@ impl Client {
         profile: &Path,
         cancel: &Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Value, String> {
-        self.session_with_system(profile, "", cancel)
+        self.new_session(profile, "", &[], false, cancel)
     }
 
     pub(super) fn session_with_system(
@@ -379,6 +552,17 @@ impl Client {
         servers: &[Value],
         cancel: &Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Value, String> {
+        self.new_session(profile, system, servers, true, cancel)
+    }
+
+    fn new_session(
+        &mut self,
+        profile: &Path,
+        system: &str,
+        servers: &[Value],
+        restrict_tools: bool,
+        cancel: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Value, String> {
         let mut params = json!({"cwd":profile.join("workspace"),"mcpServers":[]});
         if !system.is_empty() {
             match self.system_prompt {
@@ -391,9 +575,8 @@ impl Client {
                 SystemPromptSupport::Unavailable => return Err("The installed ACP CLI does not advertise system instructions support; update Antigravity CLI".into()),
             }
         }
-        if !servers.is_empty() {
-            params["mcpServers"] = json!(servers);
-            params["_meta"]["antigravity"]["eagerMcpServers"] = json!(true);
+        params["mcpServers"] = json!(servers);
+        if restrict_tools {
             params["_meta"]["agy"]["disabledTools"] = json!([
                 "list_directory",
                 "search_directory",
@@ -454,6 +637,10 @@ fn email_from_auth_log(log: &str) -> Option<String> {
         .split_once(',')?
         .0
         .trim();
+    valid_account_email(email).map(str::to_owned)
+}
+
+pub(super) fn valid_account_email(email: &str) -> Option<&str> {
     let (local, domain) = email.split_once('@')?;
     if local.is_empty()
         || !domain.contains('.')
@@ -465,7 +652,7 @@ fn email_from_auth_log(log: &str) -> Option<String> {
     {
         return None;
     }
-    Some(email.to_string())
+    Some(email)
 }
 
 impl Drop for Client {
@@ -478,6 +665,39 @@ impl Drop for Client {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn only_structured_error_fields_classify_a_remote_rejection() {
+        for status in [
+            "INVALID_ARGUMENT",
+            "UNAUTHENTICATED",
+            "PERMISSION_DENIED",
+            "RESOURCE_EXHAUSTED",
+            "UNAVAILABLE",
+            "DEADLINE_EXCEEDED",
+        ] {
+            let failure = RpcFailure::remote(
+                &json!({"code":-32603,"message":"not the status","data":{"error":{"status":status}}}),
+            );
+            assert!(
+                matches!(failure, RpcFailure::Remote { kind, .. } if !matches!(kind, Rejection::Unknown))
+            );
+        }
+        assert!(matches!(
+            RpcFailure::remote(&json!({"code":-32603,"message":"UNAVAILABLE HTTP 503"})),
+            RpcFailure::Remote {
+                kind: Rejection::Unknown,
+                ..
+            }
+        ));
+        assert!(matches!(
+            RpcFailure::remote(&json!({"code":-32000,"message":"only local UI detail"})),
+            RpcFailure::Remote {
+                kind: Rejection::Authentication,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn identity_uses_only_latest_official_auth_result() {
@@ -496,6 +716,116 @@ mod tests {
         for email in ["", "unknown", "a@b@c.test", "person @example.test"] {
             let cleared = format!("{valid}\nI1117 server_oauth.go:224] applyAuthResult: email={email}, authMethod=consumer");
             assert!(email_from_auth_log(&cleared).is_none());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_isolated_launch_handles_absolute_and_verbatim_profile_paths() {
+        use super::super::{accounts, prepare_profile};
+        let root = crate::unique_test_temp_path("acp Windows profile with spaces");
+        let home = root
+            .join("accounts")
+            .join("a".repeat(32))
+            .join(accounts::ISOLATED_HOME);
+        prepare_profile(&home).unwrap();
+        for path in [&home, &home.canonicalize().unwrap()] {
+            let command = command_with_args(Path::new("agy.exe"), path, "", &["--login"]).unwrap();
+            let args = command.get_args().collect::<Vec<_>>();
+            assert_eq!(args[0], "acp");
+            assert_eq!(args.len(), 2);
+            assert_eq!(args.last().copied(), Some(std::ffi::OsStr::new("--login")));
+            assert!(command
+                .get_envs()
+                .any(|(key, value)| key == "USERPROFILE" && value == Some(path.as_os_str())));
+            assert!(command
+                .get_envs()
+                .any(|(key, value)| key == "SSH_CONNECTION"
+                    && value == Some(std::ffi::OsStr::new("127.0.0.1 0 127.0.0.1 0"))));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Executes real child processes on Windows; cross-compilation alone does not run it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_isolated_launch_runs_npm_shims() {
+        use super::super::{accounts, prepare_profile};
+        let root = crate::unique_test_temp_path("acp Windows & profile");
+        let home = root
+            .join("accounts")
+            .join("a".repeat(32))
+            .join(accounts::ISOLATED_HOME);
+        prepare_profile(&home).unwrap();
+        let script = root.join("probe.mjs");
+        std::fs::write(
+            script,
+            r#"
+import assert from 'node:assert/strict';
+const root = process.env.USERPROFILE;
+assert.equal(process.env.HOME, root);
+assert.equal(process.env.GEMINI_CLI_HOME, root);
+assert.equal(process.env.SSH_CONNECTION, '127.0.0.1 0 127.0.0.1 0');
+assert.deepEqual(process.argv.slice(2), ['acp', '--login']);
+console.log('ACP_WINDOWS_FIXTURE_OK');
+"#,
+        )
+        .unwrap();
+        for name in ["agy.cmd", "agy.bat"] {
+            let shim = root.join(name);
+            std::fs::write(&shim, "@echo off\r\nnode \"%dp0%\\probe.mjs\" %*\r\n").unwrap();
+            let output = command_with_args(&shim, &home, "", &["--login"])
+                .unwrap()
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap().trim(),
+                "ACP_WINDOWS_FIXTURE_OK"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires checksum-verified official CLI and a private synthetic Secret Service"]
+    fn official_isolated_credential_read_without_authorization() {
+        use super::super::{accounts, prepare_profile};
+        let executable =
+            std::path::PathBuf::from(std::env::var_os("ECPA_ACP_UNAUTHORIZED_PROBE_CLI").unwrap());
+        let root = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert!(root
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("ecpa-acp-integrated-"));
+        assert_eq!(
+            std::env::var_os("DBUS_SESSION_BUS_ADDRESS").unwrap(),
+            format!("unix:path={}/bus", root.display()).as_str()
+        );
+        let control = std::env::var_os("ECPA_ACP_CONTROL_NO_SSH").is_some();
+        for (id, marker) in [("a", "{"), ("b", "{}"), ("a", "{")] {
+            let directory = root
+                .join("accounts")
+                .join(id.repeat(32))
+                .join(accounts::ISOLATED_HOME);
+            prepare_profile(&directory).unwrap();
+            let token = accounts::isolated_token(&directory);
+            std::fs::create_dir_all(token.parent().unwrap()).unwrap();
+            std::fs::write(&token, marker).unwrap();
+            let mut command = command(&executable, &directory, "").unwrap();
+            if control {
+                command.env_remove("SSH_CONNECTION");
+            }
+            let mut client = Client::spawn_command(command).unwrap();
+            let cancel = Arc::new(AtomicBool::new(false));
+            client.initialize(&cancel).unwrap();
+            assert_eq!(
+                client.session(&directory, &cancel).unwrap_err(),
+                "Authentication required"
+            );
+            assert!(client.account_email(&directory).is_none());
         }
     }
 
@@ -529,12 +859,38 @@ mod tests {
         }
         let mut request = String::new();
         std::io::stdin().read_line(&mut request).unwrap();
+        if mode == "permission-session" {
+            let prompt: Value = serde_json::from_str(&request).unwrap();
+            let mut outcomes = Vec::new();
+            for (index, session) in [json!("other"), Value::Null, json!("test")]
+                .into_iter()
+                .enumerate()
+            {
+                let id = format!("permission-{index}");
+                println!(
+                    "{}",
+                    json!({"jsonrpc":"2.0","id":id,"method":"session/request_permission","params":{"sessionId":session,"toolCall":{"title":"api_client/lookup"},"options":[{"optionId":"once","kind":"allow_once"}]}})
+                );
+                std::io::stdout().flush().unwrap();
+                let mut reply = String::new();
+                std::io::stdin().read_line(&mut reply).unwrap();
+                let reply: Value = serde_json::from_str(&reply).unwrap();
+                assert_eq!(reply["id"], id);
+                outcomes.push(reply["result"]["outcome"].clone());
+            }
+            println!(
+                "{}",
+                json!({"jsonrpc":"2.0","id":prompt["id"],"result":outcomes})
+            );
+            std::io::stdout().flush().unwrap();
+            return;
+        }
         let started = Instant::now();
         while started.elapsed() < Duration::from_secs(15) {
             if mode == "updates" {
                 println!(
                     "{}",
-                    json!({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"still working"}}}})
+                    json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"test","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"still working"}}}})
                 );
                 std::io::stdout().flush().unwrap();
             }
@@ -559,6 +915,25 @@ mod tests {
     }
 
     #[test]
+    fn only_the_active_prompt_can_request_its_declared_tool() {
+        let mut client = unresponsive_client("permission-session");
+        client.allow_api_tools(&[json!({"function":{"name":"lookup"}})]);
+        let outcomes = client
+            .call_with_timeout(
+                "session/prompt",
+                json!({"sessionId":"test"}),
+                &Arc::new(AtomicBool::new(false)),
+                Duration::from_secs(3),
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(
+            outcomes,
+            json!([{"outcome":"cancelled"},{"outcome":"cancelled"},{"outcome":"selected","optionId":"once"}])
+        );
+    }
+
+    #[test]
     fn silent_server_times_out_and_is_reaped() {
         let mut client = unresponsive_client("silent");
         let cancel = Arc::new(AtomicBool::new(false));
@@ -571,7 +946,8 @@ mod tests {
                 Duration::from_millis(100),
                 |_| {},
             )
-            .unwrap_err();
+            .unwrap_err()
+            .local_message();
         assert!(error.contains("initialize timed out"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(client.child.try_wait().unwrap().is_some());
@@ -590,7 +966,8 @@ mod tests {
                 Duration::from_millis(150),
                 |_| {},
             )
-            .unwrap_err();
+            .unwrap_err()
+            .local_message();
         assert!(error.contains("write timed out"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(client.child.try_wait().unwrap().is_some());
@@ -609,7 +986,8 @@ mod tests {
                 Duration::from_secs(1),
                 |_| updates += 1,
             )
-            .unwrap_err();
+            .unwrap_err()
+            .local_message();
         assert!(updates > 0);
         assert!(error.contains("session/prompt timed out"), "{error}");
         assert!(client.child.try_wait().unwrap().is_some());

@@ -1,9 +1,8 @@
-import type { TemplateText } from './templateConfig';
+import type { TemplateConfigGroup, TemplateText } from './templateConfig';
 import { invoke } from './platform';
 import type { ReverseProxyConfig } from './reverseProxy';
-import { generalTemplateGroups, requestTemplateGroups, routingTemplateGroups } from './generalTemplateFields';
+import { requestTemplateGroups } from './generalTemplateFields';
 import { oauthTemplateGroups } from './oauthTemplateFields';
-import { extensionTemplateGroups } from './extensionTemplateFields';
 import { payloadTemplateGroups } from './payloadTemplateFields';
 
 const text = (zh: string, en: string, ja: string): TemplateText => ({ zh, en, ja });
@@ -19,16 +18,17 @@ export const settingsCategories = [
   { id: 'software', title: text('应用偏好', 'App preferences', 'アプリの設定') },
 ] as const;
 export type SettingsCategory = typeof settingsCategories[number]['id'];
-export const settingsTemplateGroups = {
-  general: generalTemplateGroups.filter(group => group.id === 'management' || group.id === 'server'),
+
+export const settingsTemplateGroups: Record<SettingsCategory, readonly TemplateConfigGroup[]> = {
+  general: [],
   proxy: [],
   aliases: [],
-  routing: [...routingTemplateGroups, ...extensionTemplateGroups.filter(group => group.id === 'extensions-concurrency')],
+  routing: [],
   requests: [...requestTemplateGroups, ...payloadTemplateGroups],
   sensitiveWords: [],
   oauth: ['oauth-common', 'oauth-codex', 'oauth-others', 'oauth-filters', 'oauth-claude', 'oauth-claude-headers', 'oauth-models', 'oauth-media']
     .map(id => oauthTemplateGroups.find(group => group.id === id)!),
-  diagnostics: [...generalTemplateGroups.filter(group => group.id === 'diagnostics'), ...extensionTemplateGroups.filter(group => group.id === 'extensions-inflight')],
+  diagnostics: [],
   software: [],
 };
 export const allSettingsTemplateGroups = Object.values(settingsTemplateGroups).flat();
@@ -37,12 +37,19 @@ export const settingsMessages = {
   search: text('搜索设置', 'Search settings', '設定を検索'),
   searchHint: text('搜索设置…', 'Search settings…', '設定を検索…'),
   clearSearch: text('清空搜索', 'Clear search', '検索をクリア'),
+  outboundProxyTitle: text('出站代理', 'Outbound Proxy', '送信プロキシ'),
+  outboundProxySaved: text('出站代理设置已保存', 'Outbound proxy settings saved', '送信プロキシ設定を保存しました'),
   results: text('搜索结果', 'Search results', '検索結果'),
   noResults: text('没有找到匹配的设置，试试其他关键词。', 'No matching settings. Try another keyword.', '一致する設定がありません。別のキーワードをお試しください。'),
+  externalUnsupported: text('非内置 CPA 不支持该功能。', 'This feature is not supported for external CPA instances.', 'この機能は外部 CPA では利用できません。'),
+  externalRestart: text('如需重启，请在该 CPA 所在主机上操作。', 'If a restart is needed, restart CPA on its host.', '再起動が必要な場合は CPA のホストで行ってください。'),
+  readLogs: text('查看服务器日志', 'View server logs', 'サーバーログを表示'),
+  emptyLogs: text('暂无日志记录。', 'No log entries.', 'ログはありません。'),
+  enableFileLogs: text('请先启用并保存文件日志。', 'Enable and save file logging first.', '先にファイルログを有効にして保存してください。'),
   restart: text('保存后重启内核', 'Core restarts after saving', '保存後にコアを再起動'),
   automatic: text('自动保存', 'Auto-save', '自動保存'),
   dirty: text('有未保存修改', 'Unsaved changes', '未保存の変更'),
-  nativeNetwork: text('监听与上游代理', 'Listening & upstream proxy', '待ち受けと上流プロキシ'),
+  nativeNetwork: text('监听地址与端口', 'Listen Address and Port', '待ち受けアドレスとポート'),
   nativeRouting: text('凭据选择与会话', 'Credential selection & sessions', '認証情報の選択とセッション'),
   nativeRetry: text('重试与冷却', 'Retries & cooldowns', '再試行とクールダウン'),
   reverseProxyTitle: text('对外访问', 'External access', '外部アクセス'),
@@ -68,7 +75,11 @@ export const settingsMessages = {
   ),
   reverseProxyAdvancedTitle: text('高级设置', 'Advanced settings', '高度な設定'),
   reverseProxyAdvancedHint: text('通常保持默认即可。', 'Usually keeping default values is recommended.', '通常はデフォルトのままで問題ありません。'),
-  reverseProxyBindHint: text('监听所有网卡（不可修改）', 'Listens on all network interfaces (read-only)', 'すべてのネットワークインターフェースでリッスン（変更不可）'),
+  reverseProxyBindHint: text('默认 0.0.0.0（监听所有网卡），也可指定本机局域网 IP 或 127.0.0.1', 'Defaults to 0.0.0.0 (all interfaces); can also be set to a specific LAN IP or 127.0.0.1', 'デフォルトは 0.0.0.0（全インターフェース）。特定の LAN IP や 127.0.0.1 も指定可能'),
+  reverseProxyListenEndpoint: text('监听地址与端口', 'Listen IP & port', 'リッスン IP・ポート'),
+  reverseProxyForwardTo: text('转发至', 'Forwards to', '転送先'),
+  reverseProxyTargetEndpoint: text('转发目标（本机内核）', 'Forward target (local core)', '転送先（ローカルコア）'),
+  reverseProxyListenHostInvalid: text('请输入有效的监听 IP 或主机地址（不含协议或端口）', 'Enter a valid listen IP or host (without protocol or port)', '有効なリッスン IP またはホストを入力してください（プロトコルやポートを除く）'),
   reverseProxyHardeningOk: text(
     '内核保护已就绪：只监听 127.0.0.1，trusted-proxies 已设置。',
     'Core protection is ready: listening only on 127.0.0.1, trusted-proxies configured.',
@@ -121,8 +132,6 @@ export const settingsMessages = {
   reverseProxySaveApplyHint: text('切换开关后需点击保存才会生效。', 'Switch changes take effect only after saving.', '切り替えは保存後にのみ有効になります。'),
 } satisfies Record<string, TemplateText>;
 
-// The LAN address external clients can reach; get_lan_ipv4 is an existing backend
-// command. Browser mocks may return a list, so normalize to a single IPv4 string.
 export const getLanIpv4 = async (): Promise<string | null> => {
   const detected = await invoke<unknown>('get_lan_ipv4');
   const candidate = typeof detected === 'string'
@@ -137,12 +146,6 @@ export const getLanIpv4 = async (): Promise<string | null> => {
 const isReverseProxyPort = (value: number): boolean =>
   Number.isInteger(value) && value >= 1 && value <= 65535;
 
-// A disabled draft keeps its own edits whenever its ports are still usable, so
-// certificate paths and ports can be staged before the proxy is enabled. Only
-// while switching a previously enabled (or still running) proxy off does an
-// invalid draft fall back to the last saved values, keeping the stop request
-// unblocked; an already disabled proxy keeps the invalid draft so field
-// validation can report it instead of silently discarding it.
 export const resolveReverseProxySaveConfig = (
   draft: ReverseProxyConfig,
   saved?: ReverseProxyConfig | null,
@@ -154,8 +157,6 @@ export const resolveReverseProxySaveConfig = (
   return !portsValid && wasActive && saved ? { ...draft, ...saved, enabled: false } : draft;
 };
 
-// The settings page is mounted only while active, so another page hands over the
-// field to open once instead of dispatching an event nobody is listening to yet.
 let requestedSettingPath: string | null = null;
 export const openSettingField = (path: readonly string[]) => {
   requestedSettingPath = path.join('.');

@@ -7,6 +7,7 @@ mod agent_usage;
 mod agent_usage_store;
 mod app_settings;
 mod app_update;
+mod app_version_series;
 mod claude_catalog;
 mod codex_catalog;
 mod codex_sessions;
@@ -33,6 +34,7 @@ mod plugin_webview;
 mod plugins;
 mod privacy_mode;
 mod progress;
+mod remote_cpa;
 mod provider_health;
 mod reverse_proxy;
 mod auto_update;
@@ -325,6 +327,7 @@ struct AppUpdateInner {
 
 #[derive(Default)]
 struct CoreProcessState {
+    remote_selected: AtomicBool,
     recovery: core_recovery::CoreRecovery,
     child: Mutex<Option<CoreChild>>,
     adopted_processes: Mutex<Vec<AdoptedCoreProcess>>,
@@ -426,7 +429,7 @@ impl AgentConfigStatusCache {
         Ok(())
     }
 
-    fn clear(&self) -> Result<(), String> {
+    pub(crate) fn clear(&self) -> Result<(), String> {
         let mut current = self
             .entry
             .lock()
@@ -481,13 +484,19 @@ struct CoreVersionOption {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AppUpdateInfo {
-    current_version: String,
+    current_version: Option<String>,
+    latest_series_version: Option<String>,
     latest_version: String,
+    installed_series: Option<app_version_series::AppVersionSeries>,
+    comparison_newer: bool,
     update_available: bool,
+    install_available: bool,
     release_url: String,
     release_notes: HashMap<String, String>,
+    skipped_release_notes: Vec<SkippedReleaseNotes>,
     published_at: String,
     current_build_at: Option<String>,
+    latest_build_at: Option<String>,
     auto_update_supported: bool,
     preserve_core_supported: bool,
     download_url: Option<String>,
@@ -495,6 +504,13 @@ struct AppUpdateInfo {
     download_size_bytes: Option<u64>,
     unsupported_reason: Option<String>,
     update_channel: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkippedReleaseNotes {
+    version: String,
+    release_notes: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -506,6 +522,8 @@ struct PortableUpdateManifest {
     release_url: String,
     #[serde(default, deserialize_with = "deserialize_release_notes")]
     release_notes: HashMap<String, String>,
+    #[serde(default)]
+    release_notes_history: serde_json::Value,
     assets: std::collections::HashMap<String, PortableUpdateAsset>,
     #[serde(default)]
     full_assets: Option<std::collections::HashMap<String, PortableUpdateAsset>>,
@@ -680,6 +698,7 @@ struct GuiConfigFile {
     api_keys: Vec<GuiApiKeyEntry>,
     api_access_remarks: Vec<GuiApiAccessRemark>,
     management_secret_key: String,
+    management_secret_key_unmanaged: bool,
     debug: bool,
     #[serde(default = "default_update_channel")]
     update_channel: String,
@@ -988,6 +1007,7 @@ impl Default for GuiConfigFile {
             api_keys: vec![default_api_key_entry()],
             api_access_remarks: Vec::new(),
             management_secret_key: LEGACY_DEFAULT_MANAGEMENT_SECRET_KEY.to_string(),
+            management_secret_key_unmanaged: false,
             debug: false,
             update_channel: default_update_channel(),
             auto_update: auto_update::AutoUpdateSettings::default(),
@@ -1303,8 +1323,12 @@ fn default_true() -> bool {
 }
 
 fn default_update_channel() -> String {
-    // A preview binary keeps following the preview channel until switched explicitly.
-    if env!("CARGO_PKG_VERSION").to_ascii_lowercase().contains("preview") {
+    // Official packages use their explicit family; retain the historic default for older builds.
+    let preview = match option_env!("ECPA_RELEASE_FAMILY") {
+        Some(family) => family == "preview",
+        None => app_version_series::is_preview_package(env!("CARGO_PKG_VERSION")),
+    };
+    if preview {
         "preview".to_string()
     } else {
         "stable".to_string()
@@ -2015,6 +2039,7 @@ impl AppUpdateState {
 impl CoreProcessState {
     fn new(starting: bool) -> Self {
         Self {
+            remote_selected: AtomicBool::new(false),
             recovery: core_recovery::CoreRecovery::default(),
             child: Mutex::new(None),
             adopted_processes: Mutex::new(Vec::new()),
@@ -2030,6 +2055,7 @@ impl CoreProcessState {
     }
 
     fn ensure_active(&self) -> Result<(), String> {
+        if self.remote_selected.load(Ordering::Acquire) { return Err("Remote CPA selected".into()); }
         if self.is_shutting_down() || self.preserve_on_exit.load(Ordering::Acquire) {
             Err("Application is exiting; kernel operation canceled".to_string())
         } else {
@@ -2181,6 +2207,7 @@ impl GuiConfigState {
     }
 
     fn snapshot(&self) -> Result<GuiConfigFile, String> {
+        if let Ok(config) = remote_cpa::AGENT_CONFIG.try_with(Clone::clone) { return Ok(config); }
         self.inner
             .lock()
             .map(|config| config.clone())
@@ -2359,23 +2386,24 @@ impl GuiConfigState {
     fn set_management_secret_key(&self, secret_key: String) -> Result<GuiConfigFile, String> {
         self.update(|config| {
             config.management_secret_key = secret_key;
+            config.management_secret_key_unmanaged = false;
             Ok(())
         })
     }
 
     fn sync_core_settings(&self, settings: &CoreConfigSettings) -> Result<GuiConfigFile, String> {
-        self.sync_core_settings_internal(settings, None, false, false)
+        self.sync_core_settings_internal(settings, None, false, false, None)
     }
 
     fn sync_core_logging_settings(&self, settings: &CoreConfigSettings) -> Result<GuiConfigFile, String> {
-        self.sync_core_settings_internal(settings, None, false, true)
+        self.sync_core_settings_internal(settings, None, false, true, None)
     }
 
     fn sync_core_settings_external(
         &self,
         settings: &CoreConfigSettings,
     ) -> Result<GuiConfigFile, String> {
-        self.sync_core_settings_internal(settings, None, true, false)
+        self.sync_core_settings_internal(settings, None, true, false, None)
     }
 
     fn sync_core_settings_with_api_key(
@@ -2383,7 +2411,7 @@ impl GuiConfigState {
         settings: &CoreConfigSettings,
         added_api_key: Option<GuiApiKeyEntry>,
     ) -> Result<GuiConfigFile, String> {
-        self.sync_core_settings_internal(settings, added_api_key, false, false)
+        self.sync_core_settings_internal(settings, added_api_key, false, false, None)
     }
 
     fn sync_core_settings_internal(
@@ -2392,6 +2420,7 @@ impl GuiConfigState {
         added_api_key: Option<GuiApiKeyEntry>,
         apply_external_proxy: bool,
         save_usage_preference: bool,
+        management_key_override: Option<&str>,
     ) -> Result<GuiConfigFile, String> {
         self.update(|config| {
             config.api_keys = merge_core_api_keys_with_gui_metadata(
@@ -2415,12 +2444,12 @@ impl GuiConfigState {
             config.redis_usage_queue_retention_seconds =
                 settings.redis_usage_queue_retention_seconds;
             config.request_log = settings.request_log;
-            if let Some(secret_key) = settings
-                .management_secret_key
-                .as_deref()
-                .filter(|secret_key| !is_hashed_management_secret_key(secret_key))
-            {
+            if let Some(secret_key) = management_key_override.or_else(|| {
+                settings.management_secret_key.as_deref()
+                    .filter(|secret_key| !is_hashed_management_secret_key(secret_key))
+            }) {
                 config.management_secret_key = secret_key.to_string();
+                config.management_secret_key_unmanaged = management_key_override == Some("");
             }
             config.plugins_enabled = settings.plugins_enabled;
             config.routing_strategy = settings.routing_strategy.clone();
@@ -2554,6 +2583,23 @@ struct GithubAsset {
     digest: Option<String>,
 }
 
+fn start_linux_activation_for_main_window(_app: &tauri::AppHandle) {
+    #[cfg(target_os = "linux")]
+    {
+        let activation_app = _app.clone();
+        if let Err(error) = start_app_activation_listener(move || {
+            let app_handle = activation_app.clone();
+            if let Err(error) = activation_app
+                .run_on_main_thread(move || show_windows_main_window(&app_handle))
+            {
+                eprintln!("Failed to schedule showing the main window: {error}");
+            }
+        }) {
+            eprintln!("{error}");
+        }
+    }
+}
+
 fn main() {
     let helper_args = env::args_os().collect::<Vec<_>>();
     if helper_args.get(1).is_some_and(|arg| arg == "--cpa-acp-tools") {
@@ -2593,7 +2639,7 @@ fn main() {
         linux_graphics::configure();
     }
 
-    let _instance_guard = match acquire_app_instance_guard() {
+    let instance_guard = match acquire_app_instance_guard() {
         Ok(guard) => guard,
         Err(error) => {
             #[cfg(target_os = "linux")]
@@ -2606,27 +2652,39 @@ fn main() {
     };
 
     let portable_update_ack = portable_update_ack_argument();
-    let gui_config = match load_or_create_gui_config() {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("{error}");
-            if portable_update_ack.is_some() {
-                return;
+    let mut remote_cpa = remote_cpa::RemoteCpaState::load();
+    let switch_start = remote_cpa.take_builtin_start().unwrap_or_else(|error| {
+        eprintln!("Failed to clear built-in CPA start request: {error:?}");
+        true
+    });
+    let remote_launch = remote_cpa.remote_launch;
+    let gui_config = if remote_launch {
+        // Local startup can repair credentials and rewrite local CPA config.
+        // A Remote session must not load that initialization path at all.
+        app_settings::desktop_preferences_only().unwrap_or_default()
+    } else {
+        match load_or_create_gui_config() {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("{error}");
+                if portable_update_ack.is_some() {
+                    return;
+                }
+                let mut config = GuiConfigFile::default();
+                // If the GUI configuration cannot be read before the kernel starts,
+                // use the shared recovery key so requests and the generated kernel
+                // configuration stay synchronized.
+                config.management_secret_key = LEGACY_DEFAULT_MANAGEMENT_SECRET_KEY.to_string();
+                if let Err(sanitize_error) = sanitize_gui_config(&mut config) {
+                    eprintln!("Failed to initialize fixed credentials directory: {sanitize_error}");
+                }
+                config
             }
-            let mut config = GuiConfigFile::default();
-            // If the GUI configuration cannot be read before the kernel starts,
-            // use the shared recovery key so requests and the generated kernel
-            // configuration stay synchronized.
-            config.management_secret_key = LEGACY_DEFAULT_MANAGEMENT_SECRET_KEY.to_string();
-            if let Err(sanitize_error) = sanitize_gui_config(&mut config) {
-                eprintln!("Failed to initialize fixed credentials directory: {sanitize_error}");
-            }
-            config
         }
     };
     let initial_window_size = configured_window_size(&gui_config);
     let initial_window_position = configured_window_position(&gui_config);
-    let start_hidden = should_start_hidden(&gui_config);
+    let start_hidden = !switch_start && !remote_launch && should_start_hidden(&gui_config);
 
     let context = tauri::generate_context!();
     #[cfg(target_os = "linux")]
@@ -2638,12 +2696,14 @@ fn main() {
         context
     };
 
-    let app = tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            Some(vec![AUTOSTART_ARGUMENT]),
-        ))
+    let app = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    let app = app.plugin(tauri_plugin_autostart::init(
+        tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+        Some(vec![AUTOSTART_ARGUMENT]),
+    ));
+    let app = app
+        .manage(AppInstanceGuardState::new(instance_guard))
+        .manage(remote_cpa)
         .plugin(
             tauri_plugin_opener::Builder::new()
                 .open_js_links_on_click(false)
@@ -2654,9 +2714,9 @@ fn main() {
         .manage(AppUpdateState::default())
         .manage(auto_update::AutoUpdateState::default())
         .manage(window_activity::WindowActivity::default())
-        .manage(CoreProcessState::new(should_start_core_on_launch(
-            &gui_config,
-        )))
+        .manage(CoreProcessState::new(
+            !remote_launch && (switch_start || should_start_core_on_launch(&gui_config)),
+        ))
         .manage(DeepSeekHarnessProcessState::default())
         .manage(usage::UsageCollectorState::default())
         .manage(agent_usage::AgentUsageState::default())
@@ -2724,8 +2784,8 @@ fn main() {
     });
 
     #[cfg(target_os = "macos")]
-    let app = app.on_window_event(|window, event| {
-        if window.label() == "main" {
+    let app = app.on_window_event(move |window, event| {
+        if !remote_launch && !window.state::<CoreProcessState>().remote_selected.load(Ordering::Acquire) && window.label() == "main" {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 set_macos_dock_visible(window.app_handle(), false);
@@ -2738,8 +2798,8 @@ fn main() {
     });
 
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    let app = app.on_window_event(|window, event| {
-        if window.label() == "main" {
+    let app = app.on_window_event(move |window, event| {
+        if !remote_launch && !window.state::<CoreProcessState>().remote_selected.load(Ordering::Acquire) && window.label() == "main" {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 if let Err(error) = window.emit(WINDOWS_CLOSE_REQUEST_EVENT, ()) {
@@ -2761,6 +2821,20 @@ fn main() {
             if let Some(window) = app.get_webview_window("main") {
                 window.set_background_color(Some(tauri::window::Color(255, 255, 255, 255)))?;
             }
+            if remote_launch {
+                usage::start_usage_collector(app.handle().clone());
+                start_linux_activation_for_main_window(app.handle());
+                configure_initial_main_window(app.handle(), false)?;
+                if let Some(ack_path) = portable_update_ack.as_ref() {
+                    // An application update started in Local mode may land on a
+                    // saved Remote selection; acknowledge the GUI, not a core.
+                    app_update::acknowledge_update_runtime_with_probe(ack_path, false, || {
+                        Err("Unexpected core acceptance in Remote mode".into())
+                    })?;
+                }
+                return Ok(());
+            }
+
             if let Err(error) = network_proxy::refresh(app.state::<GuiConfigState>().inner()) {
                 eprintln!("Failed to read startup proxy settings: {error}");
             }
@@ -2773,6 +2847,10 @@ fn main() {
             if let Err(error) = load_codex_model_customizations(app.handle()) {
                 eprintln!("Failed to load Codex custom model configuration: {error}");
             }
+            if let Err(error) = load_agent_system_prompts(app.handle()) {
+                eprintln!("Failed to load agent system prompt configuration: {error}");
+            }
+            restore_agent_prompt_proxies(app.handle().clone());
             if let Err(error) = restore_main_window_geometry(app.handle()) {
                 eprintln!("{error}");
             }
@@ -2795,20 +2873,7 @@ fn main() {
                 eprintln!("Failed to configure startup window state: {error}");
             }
 
-            #[cfg(target_os = "linux")]
-            {
-                let activation_app = app.handle().clone();
-                if let Err(error) = start_app_activation_listener(move || {
-                    let app_handle = activation_app.clone();
-                    if let Err(error) = activation_app
-                        .run_on_main_thread(move || show_windows_main_window(&app_handle))
-                    {
-                        eprintln!("Failed to schedule showing the main window: {error}");
-                    }
-                }) {
-                    eprintln!("{error}");
-                }
-            }
+            start_linux_activation_for_main_window(app.handle());
 
             if let Err(error) =
                 configuration_watcher::start_configuration_file_watcher(app.handle().clone())
@@ -2822,9 +2887,6 @@ fn main() {
 
             let usage_app = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
-                if let Err(error) = usage::initialize_usage_storage() {
-                    eprintln!("Failed to initialize usage records directory: {error}");
-                }
                 usage::start_usage_collector(usage_app);
             });
 
@@ -2858,7 +2920,7 @@ fn main() {
                     return;
                 };
 
-                if should_start_core_on_launch(&config) {
+                if switch_start || should_start_core_on_launch(&config) {
                     if let Ok(status) =
                         current_core_status(Some(process_state.inner()), Some(config.port))
                     {
@@ -2915,13 +2977,14 @@ fn main() {
                     process_state.set_starting(false);
                     return;
                 };
-                if process_state.managed_pid().is_none() && should_start_core_on_launch(&config) {
+                if process_state.managed_pid().is_none() && (switch_start || should_start_core_on_launch(&config)) {
                     let start_result = retry_core_operation(3, Duration::from_millis(400), || {
                         process_state.ensure_active()?;
                         start_core_process_inner(process_state.inner(), &config)
                     });
                     if let Err(error) = start_result {
                         eprintln!("Failed to automatically start CPA kernel: {error}");
+                        if switch_start { process_state.recovery.halt(error); }
                         if runtime_update_ack.is_some() {
                             process_state.set_starting(false);
                             return;
@@ -2966,13 +3029,111 @@ fn main() {
             });
 
             Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
+        });
+
+    macro_rules! target_commands {
+        ($($($command:ident)::+),+ $(,)?) => {{
+            let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![$($($command)::+),+];
+            move |invoke: tauri::ipc::Invoke<tauri::Wry>| {
+                let name = invoke.message.command();
+                if false $(|| Some(name) == stringify!($($command)::+).rsplit("::").next().map(str::trim))+ {
+                    handler(invoke)
+                } else {
+                    invoke.resolver.reject(format!("Built-in CPA operation unavailable for the selected external instance: {name}"));
+                    true
+                }
+            }
+        }};
+    }
+    let remote_handler = target_commands![
+            usage::get_usage_collector_status,
+            usage::get_usage_overview,
+            usage::get_usage_analysis,
+            usage::get_usage_events,
+            usage::save_usage_events_export,
+            usage::get_usage_pricing,
+            usage::get_usage_storage_settings,
+            usage::repair_usage_cache_records,
+            usage::save_usage_storage_settings,
+            usage::shrink_usage_database,
+            usage::save_usage_model_price,
+            usage::delete_usage_model_price,
+            usage::preview_usage_model_prices,
+            usage::apply_usage_model_prices,
+            agent_usage::get_agent_usage, agent_usage::sync_agent_usage, agent_usage::get_agent_usage_storage, agent_usage::clear_agent_usage_history,
+            remote_cpa::get_cpa_connection,
+            remote_cpa::config_document::read_cpa_config_document,
+            remote_cpa::config_document::save_cpa_config_document,
+            remote_cpa::test_remote_cpa,
+            remote_cpa::select_cpa_connection,
+            remote_cpa::forget_cpa_instance,
+            remote_cpa::get_remote_cpa_keys,
+            remote_cpa::save_remote_cpa_keys,
+            remote_cpa::remote_core_settings,
+            get_thinking_aliases,
+            get_model_alias_sources,
+            get_thinking_alias_sources,
+            get_speed_aliases,
+            get_speed_alias_sources,
+            create_thinking_alias,
+            create_speed_alias,
+            get_model_alias_edit_source,
+            delete_thinking_alias,
+            delete_speed_alias,
+            get_agent_models, get_agent_config_statuses, refresh_agent_config_statuses,
+            apply_agent_config, update_agent_config, set_agent_config_enabled,
+            preview_agent_config_template, apply_agent_config_template,
+            get_agent_environment_options, get_deepseek_harness_process_status,
+            launch_agent, restart_agent_app, restart_opencode_app, restart_codex_app,
+            get_codex_cli_daemon_running, restart_codex_cli_daemon,
+            stop_deepseek_harness_process, restart_deepseek_harness_process,
+            mcp_servers::list_mcp_servers, mcp_servers::save_mcp_server, mcp_servers::delete_mcp_server,
+            mcp_servers::set_mcp_server_enabled, mcp_servers::sync_mcp_server_to_openclaw,
+            mcp_servers::import_mcp_servers_json, mcp_servers::export_mcp_servers_json, mcp_servers::open_mcp_skills_directory,
+            agent_skills::list_skills, agent_skills::get_skill_detail, agent_skills::set_skill_enabled,
+            check_app_version_display, get_update_channel, get_app_version_baselines,
+            check_app_update, get_app_update_task, get_version_source_settings,
+            sensitive_words::fetch_latest_sensitive_word_rules,
+            plugin_webview::close_plugin_webview, plugin_webview::hide_plugin_webview,
+            desktop_theme::list_custom_themes, desktop_theme::get_theme_selection,
+            get_codex_subagent_config, save_codex_subagent_config, get_zcode_subagent_config, save_zcode_subagent_config,
+            check_codex_oauth_login, restore_agent_config_backup, delete_agent_config_backup, create_agent_config_backup, list_agent_config_backups, preview_agent_config_backup,
+            get_gui_settings, get_software_settings, save_software_settings, get_usage_view_preferences, save_usage_view_preferences,
+            desktop_theme::save_theme_selection, window_material::detect_window_material, window_material::set_window_material,
+            privacy_mode::get_privacy_mode, privacy_mode::save_privacy_mode,
+            list_oauth_browsers, open_oauth_url, open_external_url,
+            management_api::import_vertex_credential, management_api::start_oauth_login,
+            management_api::get_oauth_status, management_api::submit_oauth_callback,
+            provider_health::get_core_models, provider_health::core_health_probe,
+            plugins::get_plugin_support,
+            management_api::management_request,
+            management_api::upload_auth_file,
+            management_api::prepare_management_request,
+            management_api::cancel_management_request,
+            window_activity::main_window_active,
+            desktop_theme::get_linux_system_theme,
+        ];
+    let local_handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
+            remote_cpa::get_cpa_connection,
+            remote_cpa::config_document::read_cpa_config_document,
+            remote_cpa::config_document::save_cpa_config_document,
+            remote_cpa::test_remote_cpa,
+            remote_cpa::select_cpa_connection,
+            remote_cpa::forget_cpa_instance,
             acp::get_acp_status,
             acp::acp_connect,
             acp::switch_acp_account,
             acp::add_acp_account,
+            acp::submit_acp_account_authorization,
             acp::relogin_acp_account,
+            acp::rename_acp_account,
+            acp::update_acp_account_settings,
+            acp::update_acp_pool_settings,
+            acp::verify_acp_account,
+            acp::verify_all_acp_accounts,
+            acp::reset_acp_account_cooldown,
+            acp::remove_acp_account,
+            acp::logout_acp_account,
             acp::cancel_acp_operation,
             acp::select_acp_model,
             acp::test_acp_connection,
@@ -2981,6 +3142,7 @@ fn main() {
             desktop_theme::get_linux_system_theme,
             desktop_theme::list_custom_themes,
             desktop_theme::open_custom_themes_directory,
+            desktop_theme::import_custom_theme,
             desktop_theme::get_theme_selection,
             desktop_theme::save_theme_selection,
             window_material::detect_window_material,
@@ -3058,6 +3220,8 @@ fn main() {
             save_codex_subagent_config,
             get_zcode_subagent_config,
             save_zcode_subagent_config,
+            get_agent_system_prompt_editor,
+            save_agent_system_prompt_editor,
             close_codex_config_modification,
             set_agent_config_enabled,
             update_agent_config,
@@ -3128,6 +3292,8 @@ fn main() {
             list_update_channels,
             set_update_channel,
             check_app_update,
+            check_app_version_display,
+            get_app_version_baselines,
             get_app_update_task,
             start_app_update,
             cancel_app_update,
@@ -3170,16 +3336,33 @@ fn main() {
             reverse_proxy::reverse_proxy_apply,
             reverse_proxy::reverse_proxy_start,
             reverse_proxy::reverse_proxy_stop
-        ])
-        .build(context)
-        .expect("failed to build app");
+        ];
+    let app = app.invoke_handler(move |invoke| {
+        let remote = invoke
+            .message
+            .webview()
+            .state::<remote_cpa::RemoteCpaState>()
+            .uses_external_dispatch();
+        if remote { remote_handler(invoke) } else { local_handler(invoke) }
+    });
+    let app = app.build(context).expect("failed to build app");
 
-    app.run(|app_handle, event| match event {
+    app.run(move |app_handle, event| match event {
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Reopen {
             has_visible_windows: false,
             ..
         } => show_main_window(app_handle),
+        tauri::RunEvent::ExitRequested { .. } if remote_launch => {
+            #[cfg(windows)]
+            webview_recovery::stop(app_handle);
+        }
+        tauri::RunEvent::Exit if remote_launch => {
+            #[cfg(windows)]
+            webview_recovery::stop(app_handle);
+            usage::stop_usage_collector(app_handle);
+            app_handle.state::<AppInstanceGuardState>().release();
+        }
         tauri::RunEvent::ExitRequested { api, code, .. } => {
             #[cfg(windows)]
             webview_recovery::stop(app_handle);
@@ -3205,7 +3388,9 @@ fn main() {
                     .unwrap_or_else(|error| error.into_inner());
                 let process_state = app_handle.state::<CoreProcessState>();
                 let gui_config_state = app_handle.state::<GuiConfigState>();
-                shutdown_managed_core(process_state.inner(), gui_config_state.inner());
+                if !process_state.remote_selected.load(Ordering::Acquire) {
+                    shutdown_managed_core(process_state.inner(), gui_config_state.inner());
+                }
                 process_state
                     .shutdown_complete
                     .store(true, Ordering::Release);
@@ -3225,8 +3410,11 @@ fn main() {
             let process_state = app_handle.state::<CoreProcessState>();
             if !process_state.shutdown_complete.load(Ordering::Acquire) {
                 process_state.shutting_down.store(true, Ordering::Release);
-                shutdown_managed_core(process_state.inner(), gui_config_state.inner());
+                if !process_state.remote_selected.load(Ordering::Acquire) {
+                    shutdown_managed_core(process_state.inner(), gui_config_state.inner());
+                }
             }
+            app_handle.state::<AppInstanceGuardState>().release();
         }
         _ => {}
     });

@@ -8,6 +8,7 @@ import { generalTemplateGroups, requestTemplateGroups, routingTemplateGroups } f
 import { templateMessages } from '../src/i18n/templateConfig';
 import { oauthTemplateGroups } from '../src/services/oauthTemplateFields';
 import { settingsCategories, settingsTemplateGroups } from '../src/services/settingsNavigation';
+import { CONFIG_FIELD_SEARCH_INDEX } from '../src/pages/configManagement/searchIndex';
 
 const field: TemplateConfigField = { path: ['oauth', 'providers', 'codex', 'response-steering'], type: 'boolean', label: 'Steering', defaultValue: false };
 const change = (path: string[], value: unknown, expected: unknown = null, expectedExists = false, remove = false) => ({ path, value, expected, expectedExists, remove });
@@ -104,7 +105,8 @@ describe('template configuration drafts', () => {
     expect(routingPaths).toContain('routing.retry.max-retry-interval');
     const rebindField = routingGroup.fields.find(f => f.path.join('.') === 'routing.session-affinity-rebind-on')!;
     expect(rebindField.type).toBe('select');
-    expect(rebindField.options?.map(o => o.value)).toEqual(['quota', 'any']);
+    expect(rebindField.options?.map(o => o.value)).toEqual(['quota', 'any', 'never']);
+    expect(rebindField.options?.find(o => o.value === 'never')?.label.en).toContain('Never');
 
     // 4. Client Codex
     const codexClientGroup = requestTemplateGroups.find(g => g.id === 'codex-client')!;
@@ -131,9 +133,9 @@ describe('template configuration drafts', () => {
 
     // 6. Check categories mapping
     expect(settingsCategories.map(c => c.id)).toEqual(['general', 'proxy', 'aliases', 'routing', 'requests', 'sensitiveWords', 'oauth', 'diagnostics', 'software']);
-    expect(settingsTemplateGroups.general.map(g => g.id)).toContain('server');
-    expect(settingsTemplateGroups.general.map(g => g.id)).toContain('management');
-    expect(settingsTemplateGroups.routing.map(g => g.id)).toContain('routing-advanced');
+    expect(settingsTemplateGroups.general).toEqual([]);
+    expect(settingsTemplateGroups.routing).toEqual([]);
+    expect(settingsTemplateGroups.diagnostics).toEqual([]);
     expect(settingsTemplateGroups.requests.map(g => g.id)).toContain('request-behavior');
     expect(settingsTemplateGroups.requests.map(g => g.id)).toContain('codex-client');
     expect(settingsTemplateGroups.oauth.map(g => g.id)).toContain('oauth-codex');
@@ -150,6 +152,49 @@ describe('template configuration drafts', () => {
         }
       }
     }
+  });
+
+  test('keeps native tabs free of low-level template bloat while retaining request and OAuth groups', () => {
+    expect(settingsTemplateGroups.general).toHaveLength(0);
+    expect(settingsTemplateGroups.routing).toHaveLength(0);
+    expect(settingsTemplateGroups.diagnostics).toHaveLength(0);
+    expect(settingsTemplateGroups.requests.map(group => group.id)).toContain('request-payload');
+    expect(settingsTemplateGroups.oauth.map(group => group.id)).toContain('oauth-filters');
+    expect(settingsTemplateGroups.oauth.map(group => group.id)).toContain('oauth-models');
+  });
+
+  test('exposes the Antigravity protective pause and sensitive-pattern replacements', () => {
+    const others = oauthTemplateGroups.find(group => group.id === 'oauth-others')!;
+    const pause = others.fields.find(item => item.path.join('.') === 'oauth.providers.antigravity.tos-pause-window')!;
+    expect(pause.type).toBe('string');
+    expect(pause.placeholder).toBe('6h');
+    expect(pause.defaultValue).toBeUndefined();
+    // Accepts exactly what the core's duration parser accepts; a zero or negative
+    // window is valid input that simply leaves the pause off.
+    for (const value of ['6h', '0', 'off', '', '30m', '1h30m', 'DISABLED', '0s', '-1h', '+1h', '1us', '1µs', '1ns', '300ms', ' 6h ']) {
+      expect(templateFieldValidation(pause, value)).toBeNull();
+    }
+    // Rejected because the core cannot parse them (wrong case, unknown units, or an
+    // int64-nanosecond overflow that the core would read as "disabled").
+    for (const value of ['abc', '6x', '6H', '6S', '1d', '15', '6h 30m', '1e3s', '999999999999999h', '2562048h']) {
+      expect(templateFieldValidation(pause, value)).not.toBeNull();
+    }
+
+    const patterns = others.fields.find(item => item.path.join('.') === 'oauth.providers.antigravity.sensitive-patterns-replace')!;
+    expect(patterns.type).toBe('custom');
+    expect(patterns.defaultValue).toEqual([]);
+    const rules = [
+      { pattern: '(?m)^RFC 2119[^\\n]*\\n?', replacement: '' },
+      { pattern: 'internal-only', replacement: 'Assistant' },
+    ];
+    expect(templateFieldValidation(patterns, rules)).toBeNull();
+    expect(templateFieldValidation(patterns, [{ pattern: '', replacement: '' }])).not.toBeNull();
+    expect(templateFieldValidation(patterns, [{ pattern: 'ok', replacement: 'bad\u0007' }])).not.toBeNull();
+    expect(templateFieldValidation(patterns, 'not-a-list')).not.toBeNull();
+    const saved = templateFieldSaveValue(patterns, rules);
+    expect(saved).toEqual(rules);
+    const withPath = applyTemplateChanges({}, [{ ...draftTemplateField(patterns, {}, undefined, saved)!, path: [...patterns.path] }]);
+    expect(readTemplatePath(withPath, patterns.path)).toEqual({ exists: true, value: rules });
   });
 
   test('rejects unsafe path writes', () => {
